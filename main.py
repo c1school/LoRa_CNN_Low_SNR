@@ -497,8 +497,8 @@ def evaluate_ablation_model(model_complex, model_mag, simulator, snr_list, impai
     filename = f"ser_curve_{benchmark_name.lower().replace(' ', '_')}.png"
     plt.figure(figsize=(10, 7))
     plt.semilogy(snr_list, results['Naive'], marker='x', linestyle=':', color='gray', alpha=0.5, label='Naive FFT')
-    plt.semilogy(snr_list, results['Grouped'], marker='s', linestyle='--', color='black', label='Grouped-Bin Classical')
-    plt.semilogy(snr_list, results['Mag CNN'], marker='^', linestyle='-.', color='orange', label='Mag Input CNN (Ablation)')
+    #plt.semilogy(snr_list, results['Grouped'], marker='s', linestyle='--', color='black', label='Grouped-Bin Classical')
+    #plt.semilogy(snr_list, results['Mag CNN'], marker='^', linestyle='-.', color='orange', label='Mag Input CNN (Ablation)')
     plt.semilogy(snr_list, results['Complex CNN'], marker='o', linestyle='-', color='red', linewidth=2, label='Complex Input CNN')
 
     plt.grid(True, which="both", ls="--", alpha=0.5)
