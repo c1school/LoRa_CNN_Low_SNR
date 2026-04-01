@@ -15,7 +15,6 @@ def sweep_thresholds(model, simulator, target_snr, max_cfo_hz, use_multipath, th
     print(f"{'Threshold':<10} | {'Grouped SER':<12} | {'Full-CNN SER':<14} | {'Hybrid SER':<12} | {'Hybrid PER':<12} | {'CNN Util (%)':<12}")
     print("-" * 90)
     
-    # 공정성을 위해 동일한 데이터셋(배치) 생성
     all_grouped_conf = []
     all_pred_g = []
     all_pred_c = []
@@ -61,6 +60,11 @@ def sweep_thresholds(model, simulator, target_snr, max_cfo_hz, use_multipath, th
     
     labels_pkt = labels_tensor.view(num_packets, packet_size)
     
+    # 그래프를 그리기 위해 데이터 수집
+    plot_ser_h = []
+    plot_per_h = []
+    plot_util = []
+
     for th in thresholds:
         use_cnn_mask = conf_tensor < th
         pred_hybrid = torch.where(use_cnn_mask, pred_c_tensor, pred_g_tensor)
@@ -74,8 +78,50 @@ def sweep_thresholds(model, simulator, target_snr, max_cfo_hz, use_multipath, th
         
         utilization = (use_cnn_mask.sum().item() / num_symbols) * 100
         
+        plot_ser_h.append(ser_h)
+        plot_per_h.append(per_h)
+        plot_util.append(utilization)
+        
         print(f"{th:<10.2f} | {ser_g:<12.4f} | {ser_c:<14.4f} | {ser_h:<12.4f} | {per_h:<12.4f} | {utilization:<12.1f}")
     print("=" * 90)
+
+    # --- 여기서부터 Threshold Sweep 그래프 시각화 코드 추가 ---
+    filename = f"threshold_sweep_snr{target_snr}.png"
+    fig, ax1 = plt.subplots(figsize=(9, 6))
+
+    ax1.set_xlabel('Confidence Threshold (Top1 / Top2 ratio)', fontsize=12)
+    ax1.set_ylabel('Error Rate', fontsize=12)
+    
+    # 하이브리드 성능 변화선
+    ax1.plot(thresholds, plot_ser_h, marker='o', linestyle='-', color='red', label='Hybrid SER')
+    ax1.plot(thresholds, plot_per_h, marker='d', linestyle='-.', color='purple', label='Hybrid PER')
+    
+    # 기준선 (가로선)
+    ax1.axhline(y=ser_g, color='gray', linestyle=':', label='Grouped SER Baseline')
+    ax1.axhline(y=ser_c, color='orange', linestyle='--', label='Full-CNN SER Baseline')
+
+    ax1.tick_params(axis='y')
+    ax1.grid(True, which="both", ls="--", alpha=0.5)
+    
+    # 추천 Threshold(1.5) 하이라이트
+    ax1.axvline(x=1.5, color='blue', linestyle=':', alpha=0.7)
+    ax1.text(1.52, max(plot_per_h)*0.8, 'Recommended\nOperating Point\n(Th=1.5)', color='blue', fontsize=10)
+
+    ax1.legend(loc="center left")
+
+    # 오른쪽 Y축 (CNN 사용률)
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('CNN Utilization (%)', fontsize=12, color='green')
+    ax2.plot(thresholds, plot_util, marker='*', linestyle='-', color='green', alpha=0.6, label='CNN Utilization')
+    ax2.tick_params(axis='y', labelcolor='green')
+    ax2.set_ylim([-5, 105])
+    
+    ax2.legend(loc="center right")
+
+    plt.title(f"Trade-off Analysis vs Threshold (SNR = {target_snr} dB)", fontsize=14)
+    fig.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+    plt.close()
 
 def evaluate_hybrid_packet_level(model, simulator, snr_list, max_cfo_hz, use_multipath, benchmark_name, packet_size=20, threshold=1.5):
     device = simulator.device
