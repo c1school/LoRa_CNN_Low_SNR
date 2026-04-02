@@ -11,9 +11,9 @@ def sweep_thresholds(model, simulator, target_snr, max_cfo_hz, use_multipath, th
     num_batches = (num_symbols + batch_size - 1) // batch_size
     
     print(f"\n[Threshold Sweep 분석: SNR {target_snr} dB]")
-    print("=" * 90)
-    print(f"{'Threshold':<10} | {'Grouped SER':<12} | {'Full-CNN SER':<14} | {'Hybrid SER':<12} | {'Hybrid PER':<12} | {'CNN Util (%)':<12}")
-    print("-" * 90)
+    print("=" * 110)
+    print(f"{'Threshold':<10} | {'Grp SER':<10} | {'CNN SER':<10} | {'Hyb SER':<10} | {'Hyb PER':<10} | {'Util (%)':<10} | {'ΔSER/ΔUtil (x100)':<15}")
+    print("-" * 110)
     
     all_grouped_conf = []
     all_pred_g = []
@@ -60,10 +60,13 @@ def sweep_thresholds(model, simulator, target_snr, max_cfo_hz, use_multipath, th
     
     labels_pkt = labels_tensor.view(num_packets, packet_size)
     
-    # 그래프를 그리기 위해 데이터 수집
     plot_ser_h = []
     plot_per_h = []
     plot_util = []
+
+    # 한계 효용 계산을 위한 이전 상태 기록 변수 (초기값은 Grouped-only 상태)
+    prev_ser = ser_g
+    prev_util = 0.0
 
     for th in thresholds:
         use_cnn_mask = conf_tensor < th
@@ -78,38 +81,41 @@ def sweep_thresholds(model, simulator, target_snr, max_cfo_hz, use_multipath, th
         
         utilization = (use_cnn_mask.sum().item() / num_symbols) * 100
         
+        # 한계 효용 계산 (이전 임계값 단계 대비 연산량 1%당 SER 감소량)
+        delta_ser = prev_ser - ser_h
+        delta_util = utilization - prev_util
+        efficiency = (delta_ser / delta_util * 100) if delta_util > 0 else 0.0
+        
         plot_ser_h.append(ser_h)
         plot_per_h.append(per_h)
         plot_util.append(utilization)
         
-        print(f"{th:<10.2f} | {ser_g:<12.4f} | {ser_c:<14.4f} | {ser_h:<12.4f} | {per_h:<12.4f} | {utilization:<12.1f}")
-    print("=" * 90)
+        print(f"{th:<10.2f} | {ser_g:<10.4f} | {ser_c:<10.4f} | {ser_h:<10.4f} | {per_h:<10.4f} | {utilization:<10.1f} | {efficiency:<15.4f}")
+        
+        prev_ser = ser_h
+        prev_util = utilization
+        
+    print("=" * 110)
 
-    # --- 여기서부터 Threshold Sweep 그래프 시각화 코드 추가 ---
     filename = f"threshold_sweep_snr{target_snr}.png"
     fig, ax1 = plt.subplots(figsize=(9, 6))
 
     ax1.set_xlabel('Confidence Threshold (Top1 / Top2 ratio)', fontsize=12)
     ax1.set_ylabel('Error Rate', fontsize=12)
     
-    # 하이브리드 성능 변화선
     ax1.plot(thresholds, plot_ser_h, marker='o', linestyle='-', color='red', label='Hybrid SER')
     ax1.plot(thresholds, plot_per_h, marker='d', linestyle='-.', color='purple', label='Hybrid PER')
-    
-    # 기준선 (가로선)
     ax1.axhline(y=ser_g, color='gray', linestyle=':', label='Grouped SER Baseline')
     ax1.axhline(y=ser_c, color='orange', linestyle='--', label='Full-CNN SER Baseline')
 
     ax1.tick_params(axis='y')
     ax1.grid(True, which="both", ls="--", alpha=0.5)
     
-    # 추천 Threshold(1.5) 하이라이트
     ax1.axvline(x=1.5, color='blue', linestyle=':', alpha=0.7)
-    ax1.text(1.52, max(plot_per_h)*0.8, 'Recommended\nOperating Point\n(Th=1.5)', color='blue', fontsize=10)
+    ax1.text(1.52, max(plot_per_h)*0.8, 'Recommended\nPoint (Th=1.5)', color='blue', fontsize=10)
 
     ax1.legend(loc="center left")
 
-    # 오른쪽 Y축 (CNN 사용률)
     ax2 = ax1.twinx()
     ax2.set_ylabel('CNN Utilization (%)', fontsize=12, color='green')
     ax2.plot(thresholds, plot_util, marker='*', linestyle='-', color='green', alpha=0.6, label='CNN Utilization')
@@ -154,18 +160,15 @@ def evaluate_hybrid_packet_level(model, simulator, snr_list, max_cfo_hz, use_mul
 
                 rx_signals = simulator.generate_batch(labels, snrs, cfos, use_multipath)
                 
-                # Grouped
                 grouped_energy, _ = simulator.baseline_grouped_bin(rx_signals)
                 pred_grouped = torch.argmax(grouped_energy, dim=1)
                 top2_values, _ = torch.topk(grouped_energy, 2, dim=1)
                 confidence = top2_values[:, 0] / (top2_values[:, 1] + 1e-9)
                 
-                # Full-CNN
                 features = simulator.extract_features(rx_signals)
                 cnn_outputs = model(features)
                 pred_cnn = torch.argmax(cnn_outputs, dim=1)
                 
-                # Hybrid
                 use_cnn_mask = confidence < threshold
                 pred_hybrid = torch.where(use_cnn_mask, pred_cnn, pred_grouped)
                 cnn_used_count += use_cnn_mask.sum().item()
@@ -182,12 +185,10 @@ def evaluate_hybrid_packet_level(model, simulator, snr_list, max_cfo_hz, use_mul
         pred_c_tensor = torch.cat(all_pred_c)
         pred_h_tensor = torch.cat(all_pred_h)
 
-        # Symbol-level 계산
         results["Grouped SER"].append(1.0 - (pred_g_tensor == labels_tensor).sum().item() / num_symbols)
         results["CNN SER"].append(1.0 - (pred_c_tensor == labels_tensor).sum().item() / num_symbols)
         results["Hybrid SER"].append(1.0 - (pred_h_tensor == labels_tensor).sum().item() / num_symbols)
 
-        # Packet-level 계산
         labels_pkt = labels_tensor.view(num_packets, packet_size)
         pred_g_pkt = pred_g_tensor.view(num_packets, packet_size)
         pred_c_pkt = pred_c_tensor.view(num_packets, packet_size)
@@ -202,7 +203,6 @@ def evaluate_hybrid_packet_level(model, simulator, snr_list, max_cfo_hz, use_mul
               f"SER[Grp/Cnn/Hyb]: {results['Grouped SER'][-1]:.4f} / {results['CNN SER'][-1]:.4f} / {results['Hybrid SER'][-1]:.4f} | "
               f"PER[Grp/Hyb]: {results['Grouped PER'][-1]:.4f} / {results['Hybrid PER'][-1]:.4f}")
 
-    # 시각화 (3파전)
     filename = f"hybrid_v3_{benchmark_name.lower().replace(' ', '_')}.png"
     fig, ax1 = plt.subplots(figsize=(10, 7))
 

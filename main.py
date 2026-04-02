@@ -17,7 +17,6 @@ def main():
     sim = GPUOnlineSimulator(sf=7, bw=125e3, fs=1e6, device=device)
     model = LoRaCNN(num_classes=sim.M, input_length=sim.N, in_channels=2)
     
-    # 모델 파일명에 버전 및 실험 환경 명시
     model_name = "lora_hybrid_cnn_v3_seed2026_cfo0.35_mpTrue.pth"
     model_path = os.path.join("saved_models", model_name)
 
@@ -30,7 +29,6 @@ def main():
         model.to(device)
     else:
         print(f">> {model_name} 학습을 시작합니다.")
-        # Train은 Online (매 에포크 무작위), Val은 Fixed (고정)
         ds_train = OnlineParametersDataset(sim.M, int(total_train_samples * 0.85), (-20, 0), 0.35, sim.bw)
         ds_val = FixedParametersDataset(sim.M, int(total_train_samples * 0.15), (-20, 0), 0.35, sim.bw)
         
@@ -40,15 +38,13 @@ def main():
         model = train_online_model(model, sim, dl_train, dl_val, num_epochs=20, lr=0.0005)
         torch.save(model.state_dict(), model_path)
 
-    # 1. Threshold Sweep 분석 (취약 구간인 -19dB, -17dB 측정)
-    sweep_thresholds(
-        model, sim, target_snr=-19, max_cfo_hz=max_cfo_hz, use_multipath=True, 
-        thresholds=[1.1, 1.3, 1.5, 2.0, 3.0]
-    )
-    sweep_thresholds(
-        model, sim, target_snr=-17, max_cfo_hz=max_cfo_hz, use_multipath=True, 
-        thresholds=[1.1, 1.3, 1.5, 2.0, 3.0]
-    )
+    # 1. Threshold Sweep 분석 (취약 구간 4곳으로 확장)
+    sweep_snrs = [-21, -19, -17, -15]
+    for target_snr in sweep_snrs:
+        sweep_thresholds(
+            model, sim, target_snr=target_snr, max_cfo_hz=max_cfo_hz, use_multipath=True, 
+            thresholds=[1.1, 1.3, 1.5, 2.0, 3.0]
+        )
 
     test_snrs = list(range(-25, 1, 2))
 
