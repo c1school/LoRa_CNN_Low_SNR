@@ -21,12 +21,10 @@ class GPUOnlineSimulator:
     def generate_batch(self, labels: torch.Tensor, snrs_db: torch.Tensor, cfos_hz: torch.Tensor, use_multipath: bool = True) -> torch.Tensor:
         batch_size = labels.size(0)
         
-        # 1. Base Signal Generation (Batched)
         tone_freq = (labels * self.osr).unsqueeze(1) * self.n_idx.unsqueeze(0) / self.N
         tone = torch.exp(1j * 2 * torch.pi * tone_freq)
         tx_signals = torch.exp(1j * self.base_phase.unsqueeze(0)) * tone
 
-        # 2. Multipath Application
         if use_multipath:
             impaired_signals = tx_signals.clone()
             att1 = torch.empty(batch_size, 1, device=self.device).uniform_(0.3, 0.6)
@@ -42,12 +40,10 @@ class GPUOnlineSimulator:
         else:
             impaired_signals = tx_signals
 
-        # 3. CFO Application
         t_matrix = self.n_idx.unsqueeze(0).repeat(batch_size, 1) / self.fs
         cfo_phase = 2 * torch.pi * cfos_hz.unsqueeze(1) * t_matrix
         impaired_signals = impaired_signals * torch.exp(1j * cfo_phase)
 
-        # 4. AWGN Application
         signal_power = torch.mean(torch.abs(impaired_signals)**2, dim=1, keepdim=True)
         snr_linear = 10 ** (snrs_db.unsqueeze(1) / 10)
         noise_power = signal_power / snr_linear

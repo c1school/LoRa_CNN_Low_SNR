@@ -3,111 +3,85 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 
 def get_confidence(grouped_energy, conf_type='ratio'):
-    """다양한 Confidence 지표를 계산하는 헬퍼 함수"""
     top2_values, _ = torch.topk(grouped_energy, 2, dim=1)
+    top1 = top2_values[:, 0]
+    top2 = top2_values[:, 1]
     
     if conf_type == 'ratio':
-        # Ratio: 크면 확실, 작으면 불확실
-        return top2_values[:, 0] / (top2_values[:, 1] + 1e-9)
-    elif conf_type == 'margin':
-        # Margin: 크면 확실, 작으면 불확실 (차이값)
-        return top2_values[:, 0] - top2_values[:, 1]
+        return top1 / (top2 + 1e-9)
+    elif conf_type == 'norm_margin':
+        return (top1 - top2) / (top1 + 1e-9)
     elif conf_type == 'entropy':
-        # Entropy: 작으면 확실(뾰족함), 크면 불확실(평평함)
         probs = F.softmax(grouped_energy, dim=1)
         return -torch.sum(probs * torch.log(probs + 1e-9), dim=1)
     else:
         raise ValueError("Invalid conf_type")
 
-def sweep_thresholds(model, simulator, target_snr, max_cfo_hz, use_multipath, thresholds, packet_size=20, num_packets=2000, conf_type='ratio'):
+def calibrate_adaptive_policy(model, simulator, snr_list, max_cfo_hz, use_multipath, conf_type='ratio', calibration_samples=10000):
+    """
+    고정된 성능 저하 한계선(target_ser)을 만족하면서 Util을 최소화하는 적응형 임계값을 역산
+    """
     device = simulator.device
     model.to(device)
     model.eval()
+    policy = {}
     
-    num_symbols = num_packets * packet_size
-    batch_size = 2000
-    num_batches = (num_symbols + batch_size - 1) // batch_size
+    print(f"\n[알고리즘 기반 적응형 임계값 자동 추출 | Metric: {conf_type.upper()}]")
     
-    print(f"\n[Sweep 분석: SNR {target_snr} dB | Metric: {conf_type.upper()}]")
-    print("=" * 110)
-    print(f"{'Threshold':<10} | {'Grp SER':<10} | {'CNN SER':<10} | {'Hyb SER':<10} | {'Hyb PER':<10} | {'Util (%)':<10} | {'ΔSER/ΔUtil (x100)':<15}")
-    print("-" * 110)
-    
-    all_grouped_conf, all_pred_g, all_pred_c, all_labels = [], [], [], []
-    
-    generated_symbols = 0
-    with torch.no_grad():
-        for _ in range(num_batches):
-            current_batch = min(batch_size, num_symbols - generated_symbols)
-            labels = torch.randint(0, simulator.M, (current_batch,), device=device)
-            snrs = torch.full((current_batch,), target_snr, device=device)
-            cfos = torch.empty(current_batch, device=device).uniform_(-max_cfo_hz, max_cfo_hz)
-
-            rx_signals = simulator.generate_batch(labels, snrs, cfos, use_multipath)
+    for snr in snr_list:
+        with torch.no_grad():
+            labels = torch.randint(0, simulator.M, (calibration_samples,), device=device)
+            snrs = torch.full((calibration_samples,), snr, device=device)
+            cfos = torch.empty(calibration_samples, device=device).uniform_(-max_cfo_hz, max_cfo_hz)
             
-            # Grouped & Confidence
+            rx_signals = simulator.generate_batch(labels, snrs, cfos, use_multipath)
             grouped_energy, _ = simulator.baseline_grouped_bin(rx_signals)
             pred_grouped = torch.argmax(grouped_energy, dim=1)
             confidence = get_confidence(grouped_energy, conf_type)
             
-            # CNN
             features = simulator.extract_features(rx_signals)
             pred_cnn = torch.argmax(model(features), dim=1)
             
-            all_labels.append(labels)
-            all_pred_g.append(pred_grouped)
-            all_pred_c.append(pred_cnn)
-            all_grouped_conf.append(confidence)
-            generated_symbols += current_batch
-
-    labels_tensor = torch.cat(all_labels)
-    pred_g_tensor = torch.cat(all_pred_g)
-    pred_c_tensor = torch.cat(all_pred_c)
-    conf_tensor = torch.cat(all_grouped_conf)
-    
-    ser_g = 1.0 - ((pred_g_tensor == labels_tensor).sum().item() / num_symbols)
-    ser_c = 1.0 - ((pred_c_tensor == labels_tensor).sum().item() / num_symbols)
-    labels_pkt = labels_tensor.view(num_packets, packet_size)
-    
-    prev_ser, prev_util = ser_g, 0.0
-
-    for th in thresholds:
-        # Entropy는 클수록 불확실하므로 부등호 방향이 반대임
-        if conf_type == 'entropy':
-            use_cnn_mask = conf_tensor > th
-        else:
-            use_cnn_mask = conf_tensor < th
+            ser_g = 1.0 - (pred_grouped == labels).float().mean().item()
+            ser_c = 1.0 - (pred_cnn == labels).float().mean().item()
             
-        pred_hybrid = torch.where(use_cnn_mask, pred_c_tensor, pred_g_tensor)
-        ser_h = 1.0 - ((pred_hybrid == labels_tensor).sum().item() / num_symbols)
-        
-        pred_h_pkt = pred_hybrid.view(num_packets, packet_size)
-        per_h = (torch.any(labels_pkt != pred_h_pkt, dim=1)).sum().item() / num_packets
-        
-        utilization = (use_cnn_mask.sum().item() / num_symbols) * 100
-        
-        delta_ser = prev_ser - ser_h
-        delta_util = utilization - prev_util
-        efficiency = (delta_ser / delta_util * 100) if delta_util > 0 else 0.0
-        
-        print(f"{th:<10.4f} | {ser_g:<10.4f} | {ser_c:<10.4f} | {ser_h:<10.4f} | {per_h:<10.4f} | {utilization:<10.1f} | {efficiency:<15.4f}")
-        prev_ser, prev_util = ser_h, utilization
-        
-    print("=" * 110)
+            # 허용 에러율: 두 기본 모델 중 우수한 수치 대비 0.2%p 여유 부여
+            target_ser = min(ser_g, ser_c) + 0.002 
+            
+            best_th = 1.5 if conf_type == 'ratio' else 0.5
+            min_util = 100.0
+            
+            thresholds = torch.linspace(1.0, 3.0, 41) if conf_type == 'ratio' else torch.linspace(0.0, 1.0, 41)
+            
+            for th in thresholds:
+                use_cnn = (confidence < th) if conf_type != 'entropy' else (confidence > th)
+                pred_h = torch.where(use_cnn, pred_cnn, pred_grouped)
+                ser_h = 1.0 - (pred_h == labels).float().mean().item()
+                util = use_cnn.float().mean().item() * 100
+                
+                if ser_h <= target_ser and util < min_util:
+                    best_th = th.item()
+                    min_util = util
+                    
+            policy[snr] = round(best_th, 2)
+            print(f"SNR {snr:3d} dB -> 도출된 Threshold: {policy[snr]:.2f} (예상 Util: {min_util:.1f}%)")
+            
+    return policy
 
-def evaluate_hybrid_packet_level(model, simulator, snr_list, max_cfo_hz, use_multipath, benchmark_name, packet_size=20, threshold_policy=1.5, conf_type='ratio'):
+def evaluate_hybrid_packet_level(model, simulator, snr_list, max_cfo_hz, use_multipath, benchmark_name, threshold_policy=1.5, conf_type='ratio'):
     device = simulator.device
     model.to(device)
     model.eval()
+    packet_size = 20
     
     results = {"Grouped SER": [], "CNN SER": [], "Hybrid SER": [], 
                "Grouped PER": [], "CNN PER": [], "Hybrid PER": [], "CNN Utilization": []}
     
-    print(f"\n[평가 시작: {benchmark_name} | Metric: {conf_type.upper()}]")
-    print("-" * 100)
+    print(f"\n[{benchmark_name} | Metric: {conf_type.upper()}]")
+    print(f"{'SNR':>5} | {'Th':>4} | {'Util%':>6} | {'Grp SER':>7} | {'CNN SER':>7} | {'Hyb SER':>7} | {'Grp PER':>7} | {'CNN PER':>7} | {'Hyb PER':>7}")
+    print("-" * 90)
 
     for snr in snr_list:
-        # 신뢰도를 위해 저 SNR 구간에서도 패킷 수를 1000개(2만 심볼) 이상으로 강력하게 보장
         num_packets = 2000 if snr >= -15 else 1000 
         num_symbols = num_packets * packet_size
         batch_size = 2000
@@ -117,7 +91,6 @@ def evaluate_hybrid_packet_level(model, simulator, snr_list, max_cfo_hz, use_mul
         cnn_used_count = 0
         generated_symbols = 0
 
-        # Adaptive Threshold 적용 (Dict면 SNR에 맞는 값 추출, 없거나 Float면 고정값 사용)
         th = threshold_policy.get(snr, 1.5) if isinstance(threshold_policy, dict) else threshold_policy
 
         with torch.no_grad():
@@ -155,17 +128,49 @@ def evaluate_hybrid_packet_level(model, simulator, snr_list, max_cfo_hz, use_mul
         pred_c_tensor = torch.cat(all_pred_c)
         pred_h_tensor = torch.cat(all_pred_h)
 
-        results["Grouped SER"].append(1.0 - (pred_g_tensor == labels_tensor).sum().item() / num_symbols)
-        results["CNN SER"].append(1.0 - (pred_c_tensor == labels_tensor).sum().item() / num_symbols)
-        results["Hybrid SER"].append(1.0 - (pred_h_tensor == labels_tensor).sum().item() / num_symbols)
+        ser_g = 1.0 - (pred_g_tensor == labels_tensor).float().mean().item()
+        ser_c = 1.0 - (pred_c_tensor == labels_tensor).float().mean().item()
+        ser_h = 1.0 - (pred_h_tensor == labels_tensor).float().mean().item()
+        util = (cnn_used_count / num_symbols) * 100
 
         labels_pkt = labels_tensor.view(num_packets, packet_size)
-        results["Grouped PER"].append((torch.any(labels_pkt != pred_g_tensor.view(num_packets, packet_size), dim=1)).sum().item() / num_packets)
-        results["CNN PER"].append((torch.any(labels_pkt != pred_c_tensor.view(num_packets, packet_size), dim=1)).sum().item() / num_packets)
-        results["Hybrid PER"].append((torch.any(labels_pkt != pred_h_tensor.view(num_packets, packet_size), dim=1)).sum().item() / num_packets)
-        results["CNN Utilization"].append((cnn_used_count / num_symbols) * 100)
+        per_g = (torch.any(labels_pkt != pred_g_tensor.view(num_packets, packet_size), dim=1)).float().mean().item()
+        per_c = (torch.any(labels_pkt != pred_c_tensor.view(num_packets, packet_size), dim=1)).float().mean().item()
+        per_h = (torch.any(labels_pkt != pred_h_tensor.view(num_packets, packet_size), dim=1)).float().mean().item()
 
-        print(f"SNR {snr:3d} dB | Th: {th:.2f} | Util: {results['CNN Utilization'][-1]:5.1f}% | "
-              f"SER[Grp/Cnn/Hyb]: {results['Grouped SER'][-1]:.4f} / {results['CNN SER'][-1]:.4f} / {results['Hybrid SER'][-1]:.4f}")
+        results["Grouped SER"].append(ser_g)
+        results["CNN SER"].append(ser_c)
+        results["Hybrid SER"].append(ser_h)
+        results["Grouped PER"].append(per_g)
+        results["CNN PER"].append(per_c)
+        results["Hybrid PER"].append(per_h)
+        results["CNN Utilization"].append(util)
+
+        print(f"{snr:5d} | {th:4.2f} | {util:5.1f}% | {ser_g:7.4f} | {ser_c:7.4f} | {ser_h:7.4f} | {per_g:7.4f} | {per_c:7.4f} | {per_h:7.4f}")
+
+    safe_name = benchmark_name.replace(' ', '_')
+    filename = f"{safe_name}.png"
+    fig, ax1 = plt.subplots(figsize=(10, 7))
+
+    ax1.set_xlabel('SNR [dB]', fontsize=12)
+    ax1.set_ylabel('Error Rate', fontsize=12)
+    
+    ax1.semilogy(snr_list, results["Grouped SER"], marker="x", linestyle=":", color="gray", label="Grp SER")
+    ax1.semilogy(snr_list, results["CNN SER"], marker="v", linestyle=":", color="orange", label="CNN SER")
+    ax1.semilogy(snr_list, results["Hybrid SER"], marker="o", linestyle="-", color="red", label="Hyb SER")
+    
+    ax1.grid(True, which="both", ls="--", alpha=0.5)
+    ax1.set_ylim([1e-4, 1.1])
+    ax1.legend(loc="lower left")
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('CNN Utilization (%)', fontsize=12, color='green')
+    ax2.plot(snr_list, results["CNN Utilization"], marker="*", linestyle="-", color="green", alpha=0.3, label="CNN Util")
+    ax2.set_ylim([-5, 105])
+
+    plt.title(benchmark_name, fontsize=14)
+    fig.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+    plt.close()
 
     return results

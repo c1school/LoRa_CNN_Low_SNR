@@ -19,7 +19,6 @@ def train_online_model(model, simulator, train_loader, val_loader, num_epochs=25
         for labels, snrs, cfos in train_loader:
             labels, snrs, cfos = labels.to(device), snrs.to(device), cfos.to(device)
             
-            # 훈련 중 GPU에서 실시간 신호 생성 및 특징 추출
             rx_signals = simulator.generate_batch(labels, snrs, cfos, use_multipath=True)
             features = simulator.extract_features(rx_signals)
 
@@ -33,11 +32,9 @@ def train_online_model(model, simulator, train_loader, val_loader, num_epochs=25
         model.eval()
         val_loss, correct, total = 0.0, 0, 0
         with torch.no_grad():
-            for labels, snrs, cfos in val_loader:
-                labels, snrs, cfos = labels.to(device), snrs.to(device), cfos.to(device)
-                
-                rx_signals = simulator.generate_batch(labels, snrs, cfos, use_multipath=True)
-                features = simulator.extract_features(rx_signals)
+            for labels, snrs, cfos, rx_signals, features in val_loader:
+                labels = labels.to(device)
+                features = features.to(device)
                 
                 outputs = model(features)
                 loss = criterion(outputs, labels)
