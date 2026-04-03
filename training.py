@@ -32,7 +32,7 @@ def train_online_model(model, simulator, train_loader, val_loader, num_epochs=25
         model.eval()
         val_loss, correct, total = 0.0, 0, 0
         with torch.no_grad():
-            for labels, snrs, cfos, rx_signals, features in val_loader:
+            for labels, features in val_loader:
                 labels = labels.to(device)
                 features = features.to(device)
                 

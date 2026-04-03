@@ -17,10 +17,9 @@ class OnlineParametersDataset(Dataset):
         cfo = torch.empty(1).uniform_(-self.max_cfo_hz, self.max_cfo_hz).item()
         return torch.tensor(label, dtype=torch.long), torch.tensor(snr, dtype=torch.float32), torch.tensor(cfo, dtype=torch.float32)
 
-def create_fixed_validation_set(simulator, num_samples: int, snr_range: tuple, max_cfo_bins: float):
-    """
-    다중경로 감쇠와 노이즈가 고정된 물리적 파형 텐서를 생성하여 반환하는 검증셋 생성기
-    """
+def create_fixed_feature_dataset(simulator, num_samples, snr_range, max_cfo_bins, seed=None):
+    if seed is not None: 
+        torch.manual_seed(seed)
     device = simulator.device
     max_cfo_hz = max_cfo_bins * (simulator.bw / simulator.M)
     
@@ -28,20 +27,33 @@ def create_fixed_validation_set(simulator, num_samples: int, snr_range: tuple, m
     snrs = torch.empty(num_samples, device=device).uniform_(snr_range[0], snr_range[1])
     cfos = torch.empty(num_samples, device=device).uniform_(-max_cfo_hz, max_cfo_hz)
     
-    rx_signals_list = []
     features_list = []
-    batch_size = 2000
-    
-    print(">> 고정 검증 데이터셋(Fixed Validation Set) 생성 중...")
     with torch.no_grad():
-        for i in range(0, num_samples, batch_size):
-            end = min(i + batch_size, num_samples)
-            batch_rx = simulator.generate_batch(labels[i:end], snrs[i:end], cfos[i:end], use_multipath=True)
-            batch_feat = simulator.extract_features(batch_rx)
-            rx_signals_list.append(batch_rx.cpu())
-            features_list.append(batch_feat.cpu())
+        for i in range(0, num_samples, 2000):
+            end = min(i + 2000, num_samples)
+            rx = simulator.generate_batch(labels[i:end], snrs[i:end], cfos[i:end], use_multipath=True)
+            feat = simulator.extract_features(rx)
+            features_list.append(feat.cpu())
             
-    rx_signals = torch.cat(rx_signals_list)
-    features = torch.cat(features_list)
+    return TensorDataset(labels.cpu(), torch.cat(features_list))
+
+def create_fixed_waveform_dataset(simulator, num_samples_per_snr, snr_list, max_cfo_hz, seed=None):
+    if seed is not None: 
+        torch.manual_seed(seed)
+    device = simulator.device
+    dataset_dict = {}
     
-    return TensorDataset(labels.cpu(), snrs.cpu(), cfos.cpu(), rx_signals, features)
+    for snr in snr_list:
+        labels = torch.randint(0, simulator.M, (num_samples_per_snr,), device=device)
+        snrs = torch.full((num_samples_per_snr,), snr, device=device)
+        cfos = torch.empty(num_samples_per_snr, device=device).uniform_(-max_cfo_hz, max_cfo_hz)
+        
+        rx_list = []
+        with torch.no_grad():
+            for i in range(0, num_samples_per_snr, 2000):
+                end = min(i + 2000, num_samples_per_snr)
+                rx = simulator.generate_batch(labels[i:end], snrs[i:end], cfos[i:end], use_multipath=True)
+                rx_list.append(rx.cpu())
+        
+        dataset_dict[snr] = TensorDataset(labels.cpu(), torch.cat(rx_list))
+    return dataset_dict
