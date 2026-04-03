@@ -1,138 +1,111 @@
 import os
 import torch
-from torch.utils.data import DataLoader, random_split
-
+import pandas as pd
+import matplotlib.pyplot as plt
 from utils import set_seed
-from simulator import LoRaResearchSimulator
-from dataset import LoRaResearchDataset
+from simulator import GPUOnlineSimulator
 from models import LoRaCNN
-from training import train_research_model
-from evaluation import evaluate_ablation_model
+from training import train_online_model
+from dataset import create_fixed_feature_dataset, create_fixed_waveform_dataset, OnlineParametersDataset
+from evaluation import calibrate_adaptive_policy_joint, run_evaluation
+from torch.utils.data import DataLoader
 
+def plot_summary(summary_df):
+    """논문 메인 비교용 그래프: Conventional vs Full-CNN vs Proposed Hybrid"""
+    snrs = sorted(summary_df['snr'].unique())
+    
+    for channel_type, title, filename in zip(
+        ['seen', 'unseen'], 
+        ['Seen Channel', 'Unseen Harsher Channel'], 
+        ['experiment_v6_seen_plot.png', 'experiment_v6_unseen_plot.png']
+    ):
+        adapt_type = f'adapt_{channel_type}'
+        if adapt_type not in summary_df['type'].unique():
+            continue
+            
+        data = summary_df[summary_df['type'] == adapt_type]
+        
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+        ax2 = ax1.twinx()
+        
+        # 1. 기존 LoRa 방식 (Grouped Bin Baseline)
+        ax1.semilogy(data['snr'], data['ser_g_mean'], label='Conventional LoRa (Grouped)', color='black', marker='x', linestyle=':')
+        
+        # 2. 순수 딥러닝 방식 (Full-CNN Upper Bound)
+        ax1.semilogy(data['snr'], data['ser_c_mean'], label='Full CNN', color='orange', marker='v', linestyle='-.')
+        
+        # 3. 제안하는 방식 (Proposed Hybrid Adaptive)
+        ax1.semilogy(data['snr'], data['ser_h_mean'], label='Proposed Hybrid', color='red', marker='o', linestyle='-')
+        
+        # 4. 제안하는 방식의 CNN 연산량 (Utilization)
+        ax2.plot(data['snr'], data['util_mean'], label='CNN Utilization (Proposed)', color='green', marker='*', linestyle='--')
+        
+        ax1.set_xlabel('SNR [dB]', fontsize=12)
+        ax1.set_ylabel('Symbol Error Rate (SER)', fontsize=12)
+        ax2.set_ylabel('CNN Utilization (%)', fontsize=12, color='green')
+        
+        ax1.grid(True, which='both', linestyle='--', alpha=0.5)
+        ax1.set_ylim([1e-4, 1.1]) 
+        ax2.set_ylim([-5, 105])
+        
+        # 범례 통합
+        lines_1, labels_1 = ax1.get_legend_handles_labels()
+        lines_2, labels_2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper right', bbox_to_anchor=(0.95, 0.95))
+        
+        plt.title(f'Performance Comparison ({title})', fontsize=14)
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
 
-# ============================================================
-# 7. 메인 실행 블록
-# ------------------------------------------------------------
-# 순서:
-# 1) 시뮬레이터 생성
-# 2) Complex CNN 초기화/학습(or 로드)
-# 3) Mag CNN 초기화/학습(or 로드)
-# 4) 3개 시나리오에서 benchmark 수행
-#    - Scenario A: Pure AWGN
-#    - Scenario B: Seen Impaired
-#    - Scenario C: Unseen Impaired
-# ============================================================
 def main():
-    set_seed()
-    os.makedirs("saved_models", exist_ok=True)
+    seeds = [2024, 2025, 2026] 
+    test_snrs = [-21, -19, -17, -15, -13]
+    all_runs = []
 
-    # LoRa-like simulator 생성
-    sim = LoRaResearchSimulator(sf=7, bw=125e3, fs=1e6)
+    for seed in seeds:
+        print(f"\n{'='*30}\n[RUN: Seed {seed}]\n{'='*30}")
+        set_seed(seed)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        sim = GPUOnlineSimulator(sf=7, device=device)
+        model = LoRaCNN(sim.M, sim.N).to(device)
+        
+        ds_val = create_fixed_feature_dataset(sim, 12000, (-20, 0), 0.35, seed=seed)
+        ds_calib = create_fixed_waveform_dataset(sim, 10000, test_snrs, 0.35 * (sim.bw/sim.M), seed=seed+1)
+        ds_test_seen = create_fixed_waveform_dataset(sim, 20000, test_snrs, 0.35 * (sim.bw/sim.M), seed=seed+2)
+        ds_test_unseen = create_fixed_waveform_dataset(sim, 20000, test_snrs, 0.35 * (sim.bw/sim.M) * 1.5, seed=seed+3)
 
-    # 두 모델 초기화
-    # Complex CNN: Real/Imag 2채널 입력
-    # Mag CNN: magnitude-only 1채널 입력
-    model_comp = LoRaCNN(num_classes=sim.M, input_length=sim.N, in_channels=2)
-    model_mag = LoRaCNN(num_classes=sim.M, input_length=sim.N, in_channels=1)
+        dl_train = DataLoader(OnlineParametersDataset(sim.M, 68000, (-20, 0), 0.35, sim.bw), batch_size=512)
+        dl_val = DataLoader(ds_val, batch_size=512)
+        model = train_online_model(model, sim, dl_train, dl_val, num_epochs=20)
 
-    path_comp = "saved_models/lora_comp_cnn_v2.pth"
-    path_mag = "saved_models/lora_mag_cnn_v2.pth"
+        policy = calibrate_adaptive_policy_joint(model, sim, ds_calib)
+        
+        res_fixed_seen = run_evaluation(model, sim, ds_test_seen, 1.5)
+        res_adapt_seen = run_evaluation(model, sim, ds_test_seen, policy)
+        res_fixed_unseen = run_evaluation(model, sim, ds_test_unseen, 1.5)
+        res_adapt_unseen = run_evaluation(model, sim, ds_test_unseen, policy)
 
-    # 학습 시 사용할 impaired 환경
-    train_config = {"use_cfo": True, "max_cfo_bins": 0.35, "use_multipath": True}
-    total_samples = 40000
+        for snr in test_snrs:
+            all_runs.append({'seed': seed, 'snr': snr, 'type': 'fixed_seen', **res_fixed_seen[snr]})
+            all_runs.append({'seed': seed, 'snr': snr, 'type': 'adapt_seen', **res_adapt_seen[snr]})
+            all_runs.append({'seed': seed, 'snr': snr, 'type': 'fixed_unseen', **res_fixed_unseen[snr]})
+            all_runs.append({'seed': seed, 'snr': snr, 'type': 'adapt_unseen', **res_adapt_unseen[snr]})
 
-    # 1. Complex CNN 훈련 또는 로드
-    if os.path.exists(path_comp):
-        # 이미 학습된 가중치가 있으면 재사용
-        model_comp.load_state_dict(torch.load(path_comp, map_location=torch.device("cpu")))
-    else:
-        print(">> [학습 1/2] Complex CNN 훈련 중...")
-        ds_comp = LoRaResearchDataset(
-            sim,
-            total_samples,
-            (-20, 0),
-            train_config,
-            feature_type="complex",
-        )
-        dl_train, dl_val = random_split(
-            ds_comp,
-            [int(0.85 * total_samples), total_samples - int(0.85 * total_samples)],
-        )
-        model_comp = train_research_model(
-            model_comp,
-            DataLoader(dl_train, batch_size=256, shuffle=True),
-            DataLoader(dl_val, batch_size=256),
-            num_epochs=25,
-        )
-        torch.save(model_comp.state_dict(), path_comp)
+    df = pd.DataFrame(all_runs)
+    metric_cols = ['ser_g', 'ser_c', 'ser_h', 'per_g', 'per_c', 'per_h', 'util', 'th']
+    
+    summary = df.groupby(['type', 'snr'])[metric_cols].agg(['mean', 'std']).reset_index()
+    summary.columns = ['_'.join(col).strip('_') if isinstance(col, tuple) else col for col in summary.columns.values]
+    
+    n_runs_df = df.groupby(['type', 'snr'])['seed'].count().reset_index()
+    n_runs_df.rename(columns={'seed': 'n_runs'}, inplace=True)
+    summary = pd.merge(summary, n_runs_df, on=['type', 'snr'])
 
-    # 2. Mag CNN 훈련 또는 로드
-    if os.path.exists(path_mag):
-        model_mag.load_state_dict(torch.load(path_mag, map_location=torch.device("cpu")))
-    else:
-        print("\n>> [학습 2/2] Mag CNN (Ablation) 훈련 중...")
-        ds_mag = LoRaResearchDataset(
-            sim,
-            total_samples,
-            (-20, 0),
-            train_config,
-            feature_type="mag",
-        )
-        dl_train, dl_val = random_split(
-            ds_mag,
-            [int(0.85 * total_samples), total_samples - int(0.85 * total_samples)],
-        )
-        model_mag = train_research_model(
-            model_mag,
-            DataLoader(dl_train, batch_size=256, shuffle=True),
-            DataLoader(dl_val, batch_size=256),
-            num_epochs=25,
-        )
-        torch.save(model_mag.state_dict(), path_mag)
-
-    # 평가할 SNR 점들
-    test_snrs = list(range(-25, 1, 2))
-
-    # Scenario A: Pure AWGN
-    evaluate_ablation_model(
-        model_comp,
-        model_mag,
-        sim,
-        test_snrs,
-        {"use_cfo": False, "use_multipath": False},
-        "Scenario A - Pure AWGN",
-    )
-
-    # Scenario B: Seen Impaired
-    evaluate_ablation_model(
-        model_comp,
-        model_mag,
-        sim,
-        test_snrs,
-        train_config,
-        "Scenario B - Seen Impaired",
-    )
-
-    # Scenario C: Unseen Impaired
-    config_unseen = {
-        "use_cfo": True,
-        "max_cfo_bins": 0.45,          # CFO 범위 증가
-        "use_multipath": True,
-        "multipath_taps": [0.9, -0.6j, 0.4],  # 학습 때와 다른 tap 패턴
-        "multipath_delays": [0, 4, 9],        # 더 긴 delay
-    }
-    evaluate_ablation_model(
-        model_comp,
-        model_mag,
-        sim,
-        test_snrs,
-        config_unseen,
-        "Scenario C - Unseen Impaired",
-    )
-
-    print("\n========== [완료] ==========")
-
+    summary.to_csv("experiment_v6_summary.csv", index=False)
+    print("\n>> 실험 완료. 통계 결과가 'experiment_v6_summary.csv'에 저장되었습니다.")
+    
+    plot_summary(summary)
+    print(">> 시각화 그래프가 'experiment_v6_seen_plot.png' 및 'experiment_v6_unseen_plot.png'로 저장되었습니다.")
 
 if __name__ == "__main__":
     main()

@@ -2,22 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class LoRaCNN(nn.Module):
-    """
-    complex 입력(2채널)과 mag 입력(1채널)을 같은 구조 위에서 비교하기 위해
-    in_channels만 바꿀 수 있도록 만든 범용 1D CNN.
-
-    구조:
-    Conv-BN-ReLU-Pool 블록 여러 개 -> Flatten -> FC -> Dropout -> FC
-    """
-
     def __init__(self, num_classes: int, input_length: int, in_channels: int = 2):
         super(LoRaCNN, self).__init__()
-
-        self.conv1 = nn.Conv1d(in_channels=in_channels, out_channels=32, kernel_size=9, padding=4)
+        self.conv1 = nn.Conv1d(in_channels, 32, kernel_size=9, padding=4)
         self.bn1 = nn.BatchNorm1d(32)
-        self.pool1 = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.pool1 = nn.MaxPool1d(2, 2)
 
         self.conv2 = nn.Conv1d(32, 64, kernel_size=7, padding=3)
         self.bn2 = nn.BatchNorm1d(64)
@@ -33,7 +23,6 @@ class LoRaCNN(nn.Module):
         self.flatten = nn.Flatten()
         self.dropout = nn.Dropout(0.5)
 
-        # FC 입력 차원을 자동 계산
         with torch.no_grad():
             dummy_x = torch.zeros(1, in_channels, input_length)
             dummy_x = self.pool1(F.relu(self.bn1(self.conv1(dummy_x))))
