@@ -12,23 +12,45 @@ def get_confidence(grouped_energy, conf_type='ratio'):
         return -torch.sum(p * torch.log(p + 1e-9), dim=1)
     return t1 / (t2 + 1e-9)
 
-def calibrate_adaptive_policy_joint(model, simulator, calib_dict, conf_type='ratio', ser_tol=0.002, per_tol=0.01):
+def calibrate_adaptive_policy_joint(model, simulator, calib_dict, max_cfo_hz, conf_type='ratio', ser_tol=0.002, per_tol=0.01):
     device = simulator.device
     model.eval()
     policy = {}
     packet_size = 20
+    eval_batch_size = 128 # V7.0: GPU 메모리 오버플로우 방지를 위한 배치 사이즈
+    
+    # 훈련 시와 동일한 다중 가설 격자 생성
+    cfo_grid, to_grid = simulator.generate_hypothesis_grid(max_cfo_hz, max_to_samples=4, cfo_steps=17, to_steps=9)
     
     for snr, dataset in calib_dict.items():
         labels, rx_signals = dataset.tensors
         labels, rx_signals = labels.to(device), rx_signals.to(device)
-        num_packets = len(labels) // packet_size
+        num_samples = len(labels)
+        num_packets = num_samples // packet_size
         
+        pred_g_list, pred_c_list, conf_list = [], [], []
+        
+        print(f" -> [Calibration] SNR {snr:3d} dB 다중 가설 추론 중...")
         with torch.no_grad():
-            grouped_energy, _ = simulator.baseline_grouped_bin(rx_signals)
-            pred_g = torch.argmax(grouped_energy, dim=1)
-            conf = get_confidence(grouped_energy, conf_type)
-            pred_c = torch.argmax(model(simulator.extract_features(rx_signals)), dim=1)
+            # 메모리 보호를 위한 미니 배치 추론
+            for i in range(0, num_samples, eval_batch_size):
+                end = min(i + eval_batch_size, num_samples)
+                rx_batch = rx_signals[i:end]
+                
+                # 1. 클래식 복조
+                grouped_energy, _ = simulator.baseline_grouped_bin(rx_batch)
+                pred_g_list.append(torch.argmax(grouped_energy, dim=1))
+                conf_list.append(get_confidence(grouped_energy, conf_type))
+                
+                # 2. V7.0 딥러닝 다중 가설 복조
+                features = simulator.extract_multi_hypothesis_bank(rx_batch, cfo_grid, to_grid)
+                pred_c_list.append(torch.argmax(model(features), dim=1))
+                
+            pred_g = torch.cat(pred_g_list)
+            pred_c = torch.cat(pred_c_list)
+            conf = torch.cat(conf_list)
             
+            # 메트릭 계산
             ser_g = 1.0 - (pred_g == labels).float().mean().item()
             ser_c = 1.0 - (pred_c == labels).float().mean().item()
             labels_pkt = labels.view(num_packets, packet_size)
@@ -64,23 +86,39 @@ def calibrate_adaptive_policy_joint(model, simulator, calib_dict, conf_type='rat
             policy[snr] = round(best_th if valid_found else fallback_th, 2)
     return policy
 
-def run_evaluation(model, simulator, test_dict, policy, conf_type='ratio'):
+def run_evaluation(model, simulator, test_dict, max_cfo_hz, policy, conf_type='ratio'):
     device = simulator.device
     model.eval()
     stats = {}
     packet_size = 20
+    eval_batch_size = 128
+    
+    cfo_grid, to_grid = simulator.generate_hypothesis_grid(max_cfo_hz, max_to_samples=4, cfo_steps=17, to_steps=9)
     
     for snr, dataset in test_dict.items():
         labels, rx_signals = dataset.tensors
         labels, rx_signals = labels.to(device), rx_signals.to(device)
-        num_packets = len(labels) // packet_size
+        num_samples = len(labels)
+        num_packets = num_samples // packet_size
         th = policy.get(snr, 1.5) if isinstance(policy, dict) else policy
         
+        pred_g_list, pred_c_list, conf_list = [], [], []
+        
         with torch.no_grad():
-            grouped_energy, _ = simulator.baseline_grouped_bin(rx_signals)
-            pred_g = torch.argmax(grouped_energy, dim=1)
-            conf = get_confidence(grouped_energy, conf_type)
-            pred_c = torch.argmax(model(simulator.extract_features(rx_signals)), dim=1)
+            for i in range(0, num_samples, eval_batch_size):
+                end = min(i + eval_batch_size, num_samples)
+                rx_batch = rx_signals[i:end]
+                
+                grouped_energy, _ = simulator.baseline_grouped_bin(rx_batch)
+                pred_g_list.append(torch.argmax(grouped_energy, dim=1))
+                conf_list.append(get_confidence(grouped_energy, conf_type))
+                
+                features = simulator.extract_multi_hypothesis_bank(rx_batch, cfo_grid, to_grid)
+                pred_c_list.append(torch.argmax(model(features), dim=1))
+                
+            pred_g = torch.cat(pred_g_list)
+            pred_c = torch.cat(pred_c_list)
+            conf = torch.cat(conf_list)
             
             use_cnn = (conf < th) if conf_type != 'entropy' else (conf > th)
             pred_h = torch.where(use_cnn, pred_c, pred_g)
