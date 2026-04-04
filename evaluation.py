@@ -12,14 +12,13 @@ def get_confidence(grouped_energy, conf_type='ratio'):
         return -torch.sum(p * torch.log(p + 1e-9), dim=1)
     return t1 / (t2 + 1e-9)
 
-def calibrate_adaptive_policy_joint(model, simulator, calib_dict, max_cfo_hz, conf_type='ratio', ser_tol=0.002, per_tol=0.01):
+def calibrate_adaptive_policy_joint(model, simulator, calib_dict, max_cfo_hz, conf_type='ratio'):
     device = simulator.device
     model.eval()
     policy = {}
     packet_size = 20
-    eval_batch_size = 128 # V7.0: GPU 메모리 오버플로우 방지를 위한 배치 사이즈
+    eval_batch_size = 128 
     
-    # 훈련 시와 동일한 다중 가설 격자 생성
     cfo_grid, to_grid = simulator.generate_hypothesis_grid(max_cfo_hz, max_to_samples=4, cfo_steps=17, to_steps=9)
     
     for snr, dataset in calib_dict.items():
@@ -30,19 +29,16 @@ def calibrate_adaptive_policy_joint(model, simulator, calib_dict, max_cfo_hz, co
         
         pred_g_list, pred_c_list, conf_list = [], [], []
         
-        print(f" -> [Calibration] SNR {snr:3d} dB 다중 가설 추론 중...")
+        print(f" -> [Calibration] SNR {snr:3d} dB 최적화 탐색 중...")
         with torch.no_grad():
-            # 메모리 보호를 위한 미니 배치 추론
             for i in range(0, num_samples, eval_batch_size):
                 end = min(i + eval_batch_size, num_samples)
                 rx_batch = rx_signals[i:end]
                 
-                # 1. 클래식 복조
                 grouped_energy, _ = simulator.baseline_grouped_bin(rx_batch)
                 pred_g_list.append(torch.argmax(grouped_energy, dim=1))
                 conf_list.append(get_confidence(grouped_energy, conf_type))
                 
-                # 2. V7.0 딥러닝 다중 가설 복조
                 features = simulator.extract_multi_hypothesis_bank(rx_batch, cfo_grid, to_grid)
                 pred_c_list.append(torch.argmax(model(features), dim=1))
                 
@@ -50,15 +46,17 @@ def calibrate_adaptive_policy_joint(model, simulator, calib_dict, max_cfo_hz, co
             pred_c = torch.cat(pred_c_list)
             conf = torch.cat(conf_list)
             
-            # 메트릭 계산
             ser_g = 1.0 - (pred_g == labels).float().mean().item()
             ser_c = 1.0 - (pred_c == labels).float().mean().item()
             labels_pkt = labels.view(num_packets, packet_size)
             per_g = (torch.any(labels_pkt != pred_g.view(num_packets, packet_size), dim=1)).float().mean().item()
             per_c = (torch.any(labels_pkt != pred_c.view(num_packets, packet_size), dim=1)).float().mean().item()
             
-            target_ser = min(ser_g, ser_c) + ser_tol
-            target_per = min(per_g, per_c) + per_tol
+            # V7.1: 상대 비율 기반의 Tolerance 적용
+            base_ser = min(ser_g, ser_c)
+            base_per = min(per_g, per_c)
+            target_ser = max(base_ser * 1.10, base_ser + 0.0005)
+            target_per = max(base_per * 1.10, base_per + 0.005)
             
             best_th, min_util = (3.0 if conf_type=='ratio' else 1.0), 100.0
             fallback_th, min_penalty = best_th, float('inf')

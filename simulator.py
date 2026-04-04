@@ -54,9 +54,6 @@ class GPUOnlineSimulator:
 
         return impaired_signals + noise
 
-    # ==========================================
-    # [V6 기능 유지] 클래식 및 1D CNN용 단일 가설 추출기
-    # ==========================================
     def extract_features(self, rx_signals: torch.Tensor) -> torch.Tensor:
         dechirped = rx_signals * self.downchirp.unsqueeze(0)
         fft_complex = torch.fft.fft(dechirped, dim=1)
@@ -80,59 +77,49 @@ class GPUOnlineSimulator:
             
         return grouped_energy, fft_mag_sq
 
-    # ==========================================
-    # [V7.0 신규 기능] 다중 가설 증거 볼륨 생성기
-    # ==========================================
     def generate_hypothesis_grid(self, max_cfo_hz: float, max_to_samples: int, cfo_steps: int = 17, to_steps: int = 9):
-        """다중 가설 탐색을 위한 CFO 및 Timing Offset 격자(Grid) 생성"""
         cfo_grid = torch.linspace(-max_cfo_hz, max_cfo_hz, cfo_steps, device=self.device)
         to_grid = torch.linspace(-max_to_samples, max_to_samples, to_steps, device=self.device).long()
         return cfo_grid, to_grid
 
-    def extract_multi_hypothesis_bank(self, rx_signals: torch.Tensor, cfo_grid: torch.Tensor, to_grid: torch.Tensor) -> torch.Tensor:
+    def extract_multi_hypothesis_bank(self, rx_signals: torch.Tensor, cfo_grid: torch.Tensor, to_grid: torch.Tensor, patch_size: int = 5) -> torch.Tensor:
         """
-        수신 신호에 수십 개의 CFO/Timing Offset 가설을 병렬로 적용하여 2D 특징 맵(Volume) 추출
+        V7.1: 심볼 중심 Bin(M개) 기준 주변 Patch 에너지를 함께 추출 (Ridge 캡처)
         """
         batch_size = rx_signals.size(0)
         cfo_steps = len(cfo_grid)
         to_steps = len(to_grid)
         
         bank_list = []
-        t_matrix = self.n_idx.unsqueeze(0).unsqueeze(0) / self.fs  # [1, 1, N]
+        t_matrix = self.n_idx.unsqueeze(0).unsqueeze(0) / self.fs
         
-        # CFO 보상 위상 미리 계산 (연산량 최적화): [1, cfo_steps, N]
         cfo_phase = -2 * torch.pi * cfo_grid.unsqueeze(0).unsqueeze(2) * t_matrix
         cfo_correction = torch.exp(1j * cfo_phase) 
         
+        # Patch 인덱스 계산
+        half_patch = patch_size // 2
+        offsets = torch.arange(-half_patch, half_patch + 1, device=self.device)
+        base_indices = (torch.arange(self.M, device=self.device) * self.osr).long()
+        
+        patch_indices = (base_indices.unsqueeze(1) + offsets.unsqueeze(0)) % self.N
+        patch_indices = patch_indices.view(-1)
+        
         for to in to_grid:
-            # 1. Timing Offset 보상 (순환 시프트)
-            shifted_rx = torch.roll(rx_signals, shifts=to.item(), dims=1) # [Batch, N]
-            
-            # 2. CFO 보상 적용 (브로드캐스팅 연산)
-            corrected_rx = shifted_rx.unsqueeze(1) * cfo_correction # [Batch, cfo_steps, N]
-            
-            # 3. Dechirp
+            shifted_rx = torch.roll(rx_signals, shifts=to.item(), dims=1)
+            corrected_rx = shifted_rx.unsqueeze(1) * cfo_correction 
             dechirped = corrected_rx * self.downchirp.unsqueeze(0).unsqueeze(0)
             
-            # 4. FFT 수행
             fft_complex = torch.fft.fft(dechirped, dim=2)
+            fft_m_patch = fft_complex[:, :, patch_indices] 
             
-            # 5. 메모리 최적화: N개의 Bin 중 심볼 판단에 필요한 M개의 핵심 Bin만 추출
-            indices = (torch.arange(self.M, device=self.device) * self.osr).long()
-            fft_m = fft_complex[:, :, indices] # [Batch, cfo_steps, M]
+            bank_list.append(fft_m_patch)
             
-            bank_list.append(fft_m)
-            
-        # 형태 변환: [Batch, to_steps, cfo_steps, M] -> [Batch, Num_Hypotheses, M]
         bank_tensor = torch.stack(bank_list, dim=1) 
         num_hypotheses = to_steps * cfo_steps
-        bank_tensor = bank_tensor.view(batch_size, num_hypotheses, self.M)
+        bank_tensor = bank_tensor.view(batch_size, num_hypotheses, self.M * patch_size)
         
-        # 가설별 독립 정규화 (Peak 분별력 강화)
         max_vals = torch.max(torch.abs(bank_tensor), dim=2, keepdim=True).values + 1e-10
         bank_norm = bank_tensor / max_vals
         
-        # Real/Imag 2채널 분리
         features = torch.stack((torch.real(bank_norm), torch.imag(bank_norm)), dim=1)
-        
-        return features # Output Shape: [Batch, 2, Num_Hypotheses, M]
+        return features
