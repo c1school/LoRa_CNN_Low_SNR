@@ -510,9 +510,6 @@ hybrid policy를 사용했을 때의 SER이다.
 
 이 저장소는 다음 목적에 적합하다.
 
-- 캡스톤디자인 프로젝트
-- 연구용 시뮬레이션
-- 논문 실험 재현
 - LoRa hybrid receiver 구조 학습
 - ultra-low SNR 보조 복조 연구
 
