@@ -1,304 +1,574 @@
+"""학습된 수신기들을 평가하고, 하이브리드 정책을 보정하는 파일이다.
+
+이 파일은 다음 작업을 담당한다.
+
+- 기본 복조기 score로부터 confidence 계산
+- calibration 데이터에서 하이브리드 정책 보정
+- seen / unseen 데이터셋에 대한 SER / PER 계산
+- 각 수신기 경로의 상대적 지연시간 측정
+"""
+
+from typing import Dict
+
 import torch
-import numpy as np
 import torch.nn.functional as F
+
 from config import CFG
+from utils import benchmark_callable, get_max_cfo_hz
 
 
+def get_confidence(grouped_energy: torch.Tensor, conf_type: str = "ratio") -> torch.Tensor:
+    """기본 복조기 출력 에너지로부터 confidence를 계산한다.
 
-def get_confidence(grouped_energy, conf_type='ratio'):
-    """
-    baseline grouped energy로부터 confidence를 계산하는 함수이다.
-
-    이 함수는 classical receiver가 얼마나 확신을 갖고 있는지를 수치로 표현한다.
-    현재는 세 가지 방식을 지원한다.
-    1) ratio      : top1 / top2 비율을 사용한다.
-    2) norm_margin: (top1 - top2) / top1 형태의 정규화 차이를 사용한다.
-    3) entropy    : softmax 분포의 엔트로피를 사용한다.
-
-    연구의 기본값은 ratio이다.
-    ratio가 크면 1등 후보가 2등 후보보다 훨씬 크다는 뜻이므로
-    classical receiver가 자신 있다고 해석한다.
+    confidence는 하이브리드 정책이 CNN을 호출할지 말지를 결정하는 기준이 된다.
     """
 
-    # grouped_energy에서 상위 2개의 값만 뽑아낸다.
     top2_values, _ = torch.topk(grouped_energy, 2, dim=1)
     t1, t2 = top2_values[:, 0], top2_values[:, 1]
 
-    if conf_type == 'ratio':
-        # 1등 에너지를 2등 에너지로 나눈 값이다.
-        # 값이 크면 확신이 높다고 본다.
+    if conf_type == "ratio":
         return t1 / (t2 + 1e-9)
 
-    if conf_type == 'norm_margin':
-        # 1등과 2등의 차이를 1등 값으로 정규화한 것이다.
-        # 값이 클수록 1등 후보가 더 뚜렷하다고 본다.
+    if conf_type == "norm_margin":
         return (t1 - t2) / (t1 + 1e-9)
 
-    if conf_type == 'entropy':
-        # grouped energy를 확률처럼 해석하기 위해 softmax를 취한 뒤,
-        # 엔트로피를 계산한다.
-        # 엔트로피가 크면 후보들이 고르게 퍼져 있다는 뜻이므로
-        # 오히려 불확실성이 높다고 해석한다.
-        p = F.softmax(grouped_energy, dim=1)
-        return -torch.sum(p * torch.log(p + 1e-9), dim=1)
+    if conf_type == "entropy":
+        probabilities = F.softmax(grouped_energy, dim=1)
+        return -torch.sum(probabilities * torch.log(probabilities + 1e-9), dim=1)
 
-    # 지정하지 않았을 때는 ratio를 기본값으로 사용한다.
-    return t1 / (t2 + 1e-9)
+    raise ValueError(f"Unsupported confidence type: {conf_type}")
 
 
+def _compute_packet_error_rate(labels: torch.Tensor, predictions: torch.Tensor, payload_symbols: int) -> float:
+    """패킷 안 심볼 중 하나라도 틀리면 해당 패킷을 오류로 보는 PER를 계산한다."""
 
-def calibrate_adaptive_policy_joint(model, simulator, calib_dict, max_cfo_hz, conf_type='ratio'):
+    if labels.numel() != predictions.numel():
+        raise ValueError("labels and predictions must have the same number of samples.")
+    if labels.numel() % payload_symbols != 0:
+        raise ValueError("The number of samples must be divisible by payload_symbols.")
+    num_packets = labels.numel() // payload_symbols
+    labels_packet = labels.view(num_packets, payload_symbols)
+    preds_packet = predictions.view(num_packets, payload_symbols)
+    return (torch.any(labels_packet != preds_packet, dim=1)).float().mean().item()
+
+
+def _compute_sample_error_rate(labels: torch.Tensor, predictions: torch.Tensor) -> float:
+    """심볼 단위 오류율인 SER를 계산한다."""
+
+    if labels.numel() != predictions.numel():
+        raise ValueError("labels and predictions must have the same number of samples.")
+    return 1.0 - (labels == predictions).float().mean().item()
+
+
+def _materialize_policy(policy: Dict, device: torch.device, dtype: torch.dtype) -> Dict:
+    """파이썬 dict로 저장된 정책을 텐서 기반 실행 형태로 변환한다."""
+
+    if policy["mode"] == "threshold":
+        return policy
+
+    if policy["mode"] == "bin":
+        return {
+            "mode": "bin",
+            "edges": torch.tensor(policy["edges"], device=device, dtype=dtype),
+            "use_cnn_by_bin": torch.tensor(policy["use_cnn_by_bin"], device=device, dtype=torch.bool),
+        }
+
+    raise ValueError(f"Unsupported policy mode: {policy['mode']}")
+
+
+def _policy_mask(confidence: torch.Tensor, policy: Dict, conf_type: str) -> torch.Tensor:
+    """각 샘플에서 CNN을 사용할지 여부를 bool mask로 반환한다."""
+
+    if policy["mode"] == "threshold":
+        threshold = policy["threshold"]
+        return (confidence > threshold) if conf_type == "entropy" else (confidence < threshold)
+
+    if policy["mode"] == "bin":
+        bin_ids = torch.bucketize(confidence, policy["edges"][1:-1], right=False)
+        return policy["use_cnn_by_bin"][bin_ids]
+
+    raise ValueError(f"Unsupported policy mode: {policy['mode']}")
+
+
+def _flatten_outputs(records_by_snr: Dict[int, Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """SNR별 레코드를 하나의 큰 텐서 묶음으로 합친다."""
+
+    merged = {}
+    keys = next(iter(records_by_snr.values())).keys()
+    for key in keys:
+        merged[key] = torch.cat([records_by_snr[snr][key] for snr in sorted(records_by_snr.keys())], dim=0)
+    return merged
+
+
+def _validate_record(record: Dict[str, torch.Tensor]) -> None:
+    """레코드 안의 예측 길이가 모두 동일한지 검증한다."""
+
+    base_length = record["labels"].numel()
+    for key in ("pred_single", "pred_mh", "pred_cnn", "confidence"):
+        if record[key].numel() != base_length:
+            raise ValueError(f"`{key}` has {record[key].numel()} samples but expected {base_length}.")
+
+
+def collect_receiver_outputs(
+    model,
+    simulator,
+    dataset_dict,
+    channel_profile,
+    feature_cfg=None,
+    eval_batch_size=None,
+    hybrid_cfg=None,
+):
+    """데이터셋 전체에 대해 각 수신기 경로의 출력을 수집한다.
+
+    반환값은 SNR별로 다음 항목을 가진 딕셔너리다.
+
+    - labels
+    - Default LoRa 예측
+    - Enhanced LoRa 예측
+    - Full CNN 예측
+    - Default LoRa confidence
     """
-    calibration 데이터셋을 이용하여 SNR별 adaptive threshold를 자동으로 찾는 함수이다.
 
-    목표는 다음과 같다.
-    - SER과 PER이 baseline 대비 지나치게 나빠지지 않도록 제한한다.
-    - 그 조건을 만족하는 threshold 중에서 CNN 사용률(utilization)이 가장 낮은 값을 찾는다.
+    feature_cfg = CFG["feature_bank"] if feature_cfg is None else feature_cfg
+    eval_batch_size = CFG["training"]["eval_batch_size"] if eval_batch_size is None else eval_batch_size
+    hybrid_cfg = CFG["hybrid"] if hybrid_cfg is None else hybrid_cfg
+    conf_type = hybrid_cfg["confidence_type"]
 
-    즉, 단순히 성능만 최대화하는 것이 아니라,
-    "성능을 크게 해치지 않으면서 CNN 호출을 최대한 줄이는 정책"을 찾고자 하였다.
-    """
-
-    device = simulator.device
-
-    # 평가 모드로 전환한다.
-    # dropout, batchnorm 동작을 추론용으로 고정하기 위함이다.
-    model.eval()
-
-    # 최종적으로 SNR별 threshold를 저장할 딕셔너리이다.
-    policy = {}
-
-    # 중앙 설정값을 불러온다.
-    packet_size = CFG["packet_size"]
-    eval_batch_size = CFG["eval_batch_size"]
-
-    # calibration 전체에 공통으로 사용할 가설 격자를 만든다.
+    resolved_profile = simulator.resolve_channel_profile(channel_profile)
+    max_cfo_hz = get_max_cfo_hz(simulator, channel_profile)
     cfo_grid, to_grid = simulator.generate_hypothesis_grid(
         max_cfo_hz,
-        CFG["max_to_samples"],
-        CFG["cfo_steps"],
-        CFG["to_steps"],
+        resolved_profile["max_to_samples"],
+        feature_cfg["cfo_steps"],
+        feature_cfg["to_steps"],
+    )
+    helper = simulator.prepare_hypothesis_helper(
+        cfo_grid,
+        to_grid,
+        feature_cfg["patch_size"],
     )
 
-    # 각 SNR별 데이터셋에 대해 threshold를 따로 찾는다.
-    for snr, dataset in calib_dict.items():
-        labels, rx_signals = dataset.tensors
-        labels, rx_signals = labels.to(device), rx_signals.to(device)
-
-        num_samples = len(labels)
-        num_packets = num_samples // packet_size
-
-        # 미니배치로 나누어 계산한 결과를 모을 리스트이다.
-        pred_g_list, pred_c_list, conf_list = [], [], []
-
-        print(f" -> SNR {snr:3d}dB에서 최적 임계값을 탐색 중.")
-
-        with torch.no_grad():
-            # 한 번에 전체를 처리하면 메모리 사용량이 커지므로
-            # 평가도 배치 분할 방식으로 진행하였다.
-            for i in range(0, num_samples, eval_batch_size):
-                end = min(i + eval_batch_size, num_samples)
-                rx_batch = rx_signals[i:end]
-
-                # 1. classical grouped-bin 복조 결과를 계산한다.
-                grouped_energy, _ = simulator.baseline_grouped_bin(rx_batch)
-                pred_g_list.append(torch.argmax(grouped_energy, dim=1))
-                conf_list.append(get_confidence(grouped_energy, conf_type))
-
-                # 2. 다중 가설 특징맵을 만들고 CNN 예측을 구한다.
-                features = simulator.extract_multi_hypothesis_bank(
-                    rx_batch,
-                    cfo_grid,
-                    to_grid,
-                    CFG["patch_size"],
-                )
-                pred_c_list.append(torch.argmax(model(features), dim=1))
-
-            # 배치별 결과를 하나의 텐서로 합친다.
-            pred_g = torch.cat(pred_g_list)
-            pred_c = torch.cat(pred_c_list)
-            conf = torch.cat(conf_list)
-
-            # ------------------------------------------------------------
-            # baseline 성능 계산
-            # ------------------------------------------------------------
-            ser_g = 1.0 - (pred_g == labels).float().mean().item()
-            ser_c = 1.0 - (pred_c == labels).float().mean().item()
-
-            labels_pkt = labels.view(num_packets, packet_size)
-            per_g = (torch.any(labels_pkt != pred_g.view(num_packets, packet_size), dim=1)).float().mean().item()
-            per_c = (torch.any(labels_pkt != pred_c.view(num_packets, packet_size), dim=1)).float().mean().item()
-
-            # baseline과 CNN 중 더 좋은 쪽을 기준 성능으로 잡는다.
-            base_ser = min(ser_g, ser_c)
-            base_per = min(per_g, per_c)
-
-            # ------------------------------------------------------------
-            # 허용 오차 설정
-            # ------------------------------------------------------------
-            # 극저 SNR에서는 base error 자체가 매우 크므로
-            # 상대 10% 허용만 쓰면 너무 느슨해질 수 있다.
-            # 그래서 -21 dB 같은 구간은 절대 마진을 사용하였다.
-            if snr <= -20:
-                target_ser = base_ser + 0.005
-                target_per = base_per + 0.01
-            else:
-                # 그 외 구간에서는 base 성능 대비 10% 열화 허용과
-                # 최소 절대 마진을 동시에 고려하였다.
-                target_ser = max(base_ser * 1.10, base_ser + 0.0005)
-                target_per = max(base_per * 1.10, base_per + 0.005)
-
-            # ------------------------------------------------------------
-            # threshold 후보 탐색 준비
-            # ------------------------------------------------------------
-            # best_th는 조건을 만족하는 후보 중 util이 최소인 값을 저장한다.
-            best_th = 3.0 if conf_type == 'ratio' else 1.0
-            min_util = 100.0
-
-            # fallback_th는 모든 조건을 만족하는 후보가 없을 때 사용할 후보이다.
-            # penalty가 가장 작은 threshold를 저장한다.
-            fallback_th = best_th
-            min_penalty = float('inf')
-            valid_found = False
-
-            # ratio는 보통 1.0 ~ 3.0 범위를 쓰고,
-            # 다른 지표는 0.0 ~ 1.0 범위를 탐색한다.
-            search_space = torch.linspace(1.0, 3.0, 41) if conf_type == 'ratio' else torch.linspace(0.0, 1.0, 41)
-
-            # ------------------------------------------------------------
-            # threshold sweep
-            # ------------------------------------------------------------
-            for th in search_space:
-                # ratio와 norm_margin은 값이 작을수록 불확실하다고 보고 CNN을 사용한다.
-                # entropy는 값이 클수록 불확실하므로 방향이 반대이다.
-                use_cnn = (conf < th) if conf_type != 'entropy' else (conf > th)
-
-                # threshold 조건에 따라 baseline과 CNN 결과 중 하나를 선택한다.
-                pred_h = torch.where(use_cnn, pred_c, pred_g)
-
-                # hybrid SER / PER / utilization을 계산한다.
-                s_h = 1.0 - (pred_h == labels).float().mean().item()
-                p_h = (torch.any(labels_pkt != pred_h.view(num_packets, packet_size), dim=1)).float().mean().item()
-                util = use_cnn.float().mean().item() * 100
-
-                # 조건을 만족하면서 util이 가장 작은 후보를 정답으로 채택한다.
-                if s_h <= target_ser and p_h <= target_per and util < min_util:
-                    best_th = th.item()
-                    min_util = util
-                    valid_found = True
-
-                # 조건을 만족하는 후보가 하나도 없을 수도 있으므로,
-                # 그 경우를 대비해 penalty가 가장 작은 후보도 따로 추적한다.
-                penalty = max(0, s_h - target_ser) * 10 + max(0, p_h - target_per) * 5 + (util / 100)
-                if penalty < min_penalty:
-                    min_penalty = penalty
-                    fallback_th = th.item()
-
-            # 최종 threshold를 정책 딕셔너리에 저장한다.
-            # 유효 후보가 있으면 best_th를 쓰고,
-            # 없으면 fallback_th를 쓴다.
-            policy[snr] = round(best_th if valid_found else fallback_th, 2)
-
-    return policy
-
-
-
-def run_evaluation(model, simulator, test_dict, max_cfo_hz, policy, conf_type='ratio'):
-    """
-    주어진 policy로 최종 평가를 수행하는 함수이다.
-
-    입력 policy는 두 가지 형태를 받을 수 있다.
-    1) float  : 모든 SNR에 같은 고정 threshold를 적용한다.
-    2) dict   : SNR별 adaptive threshold를 적용한다.
-
-    반환값은 SNR별 통계 정보를 담은 딕셔너리이다.
-    여기에는 SER, PER, utilization, threshold가 모두 들어간다.
-    """
-
-    device = simulator.device
+    outputs = {}
     model.eval()
+    with torch.inference_mode():
+        for snr in sorted(dataset_dict):
+            labels, rx_signals = dataset_dict[snr].tensors
+            labels = labels.to(simulator.device)
+            rx_signals = rx_signals.to(simulator.device)
+
+            pred_single = []
+            pred_mh = []
+            pred_cnn = []
+            confidence = []
+
+            for start in range(0, labels.size(0), eval_batch_size):
+                end = min(start + eval_batch_size, labels.size(0))
+                rx_batch = rx_signals[start:end]
+
+                # Default LoRa 경로: dechirp + FFT + grouped-bin
+                grouped_single, _ = simulator.baseline_grouped_bin(
+                    rx_batch,
+                    window_size=feature_cfg["baseline_window"],
+                )
+                pred_single.append(torch.argmax(grouped_single, dim=1))
+                confidence.append(get_confidence(grouped_single, conf_type=conf_type))
+
+                # Enhanced LoRa와 Full CNN은 같은 hypothesis bank를 공유한다.
+                features, energy_bank = simulator.extract_multi_hypothesis_bank(
+                    rx_batch,
+                    helper=helper,
+                    return_energy=True,
+                )
+                mh_scores = torch.max(energy_bank, dim=1).values
+                pred_mh.append(torch.argmax(mh_scores, dim=1))
+                pred_cnn.append(torch.argmax(model(features), dim=1))
+
+            record = {
+                "labels": labels.cpu(),
+                "pred_single": torch.cat(pred_single).cpu(),
+                "pred_mh": torch.cat(pred_mh).cpu(),
+                "pred_cnn": torch.cat(pred_cnn).cpu(),
+                "confidence": torch.cat(confidence).cpu(),
+            }
+            _validate_record(record)
+            outputs[snr] = record
+
+    return outputs
+
+
+def calibrate_global_threshold_from_outputs(
+    records_by_snr: Dict[int, Dict[str, torch.Tensor]],
+    hybrid_cfg=None,
+    payload_symbols=None,
+):
+    """단일 threshold 하나로 하이브리드 정책을 보정한다.
+
+    목표는 Full CNN과 거의 비슷한 SER / PER를 유지하면서 CNN 사용률을 최소화하는 것이다.
+    """
+
+    hybrid_cfg = CFG["hybrid"] if hybrid_cfg is None else hybrid_cfg
+    payload_symbols = CFG["experiment"]["payload_symbols"] if payload_symbols is None else payload_symbols
+    conf_type = hybrid_cfg["confidence_type"]
+
+    records = _flatten_outputs(records_by_snr)
+    labels = records["labels"]
+    pred_single = records["pred_single"]
+    pred_cnn = records["pred_cnn"]
+    confidence = records["confidence"]
+
+    ser_c = _compute_sample_error_rate(labels, pred_cnn)
+    per_c = _compute_packet_error_rate(labels, pred_cnn, payload_symbols)
+    target_ser = ser_c + hybrid_cfg["ser_tolerance"]
+    target_per = per_c + hybrid_cfg["per_tolerance"]
+
+    candidate_grid = torch.linspace(
+        0.0,
+        1.0,
+        steps=hybrid_cfg["global_threshold_grid"],
+        device=confidence.device,
+    )
+    thresholds = torch.unique(torch.quantile(confidence, candidate_grid))
+
+    best_policy = None
+    best_util = float("inf")
+    fallback_policy = None
+    fallback_penalty = float("inf")
+
+    for threshold in thresholds:
+        use_cnn = (confidence > threshold) if conf_type == "entropy" else (confidence < threshold)
+        pred_hybrid = torch.where(use_cnn, pred_cnn, pred_single)
+
+        ser_h = _compute_sample_error_rate(labels, pred_hybrid)
+        per_h = _compute_packet_error_rate(labels, pred_hybrid, payload_symbols)
+        util = use_cnn.float().mean().item() * 100.0
+
+        if ser_h <= target_ser and per_h <= target_per and util < best_util:
+            best_util = util
+            best_policy = {"mode": "threshold", "threshold": float(threshold.item())}
+
+        penalty = max(0.0, ser_h - target_ser) * 1000.0 + max(0.0, per_h - target_per) * 500.0 + util
+        if penalty < fallback_penalty:
+            fallback_penalty = penalty
+            fallback_policy = {"mode": "threshold", "threshold": float(threshold.item())}
+
+    return best_policy if best_policy is not None else fallback_policy
+
+
+def calibrate_confidence_bin_policy_from_outputs(
+    records_by_snr: Dict[int, Dict[str, torch.Tensor]],
+    hybrid_cfg=None,
+    payload_symbols=None,
+):
+    """confidence 구간별로 CNN 사용 여부를 정하는 bin policy를 보정한다."""
+
+    hybrid_cfg = CFG["hybrid"] if hybrid_cfg is None else hybrid_cfg
+    payload_symbols = CFG["experiment"]["payload_symbols"] if payload_symbols is None else payload_symbols
+    conf_type = hybrid_cfg["confidence_type"]
+
+    records = _flatten_outputs(records_by_snr)
+    labels = records["labels"]
+    pred_single = records["pred_single"]
+    pred_cnn = records["pred_cnn"]
+    confidence = records["confidence"]
+
+    ser_c = _compute_sample_error_rate(labels, pred_cnn)
+    per_c = _compute_packet_error_rate(labels, pred_cnn, payload_symbols)
+    target_ser = ser_c + hybrid_cfg["ser_tolerance"]
+    target_per = per_c + hybrid_cfg["per_tolerance"]
+
+    quantiles = torch.linspace(
+        0.0,
+        1.0,
+        steps=hybrid_cfg["confidence_bins"] + 1,
+        device=confidence.device,
+    )
+    edges = torch.quantile(confidence, quantiles)
+    edges[0] = torch.tensor(float("-inf"), device=confidence.device)
+    edges[-1] = torch.tensor(float("inf"), device=confidence.device)
+
+    bin_ids = torch.bucketize(confidence, edges[1:-1], right=False)
+    num_bins = hybrid_cfg["confidence_bins"]
+
+    bin_means = []
+    for bin_idx in range(num_bins):
+        mask = bin_ids == bin_idx
+        if torch.any(mask):
+            bin_means.append((bin_idx, float(confidence[mask].mean().item())))
+        else:
+            bin_means.append((bin_idx, float(edges[bin_idx + 1].item())))
+
+    reverse = conf_type == "entropy"
+    ordered_bins = [bin_idx for bin_idx, _ in sorted(bin_means, key=lambda item: item[1], reverse=reverse)]
+
+    best_policy = None
+    best_util = float("inf")
+    fallback_policy = None
+    fallback_penalty = float("inf")
+
+    use_cnn_by_bin = torch.zeros(num_bins, dtype=torch.bool, device=confidence.device)
+    for cutoff in range(num_bins + 1):
+        if cutoff > 0:
+            use_cnn_by_bin[ordered_bins[cutoff - 1]] = True
+
+        use_cnn = use_cnn_by_bin[bin_ids]
+        pred_hybrid = torch.where(use_cnn, pred_cnn, pred_single)
+        ser_h = _compute_sample_error_rate(labels, pred_hybrid)
+        per_h = _compute_packet_error_rate(labels, pred_hybrid, payload_symbols)
+        util = use_cnn.float().mean().item() * 100.0
+
+        policy = {
+            "mode": "bin",
+            "edges": [float(value) for value in edges.tolist()],
+            "use_cnn_by_bin": [bool(value) for value in use_cnn_by_bin.tolist()],
+        }
+
+        if ser_h <= target_ser and per_h <= target_per and util < best_util:
+            best_util = util
+            best_policy = policy.copy()
+
+        penalty = max(0.0, ser_h - target_ser) * 1000.0 + max(0.0, per_h - target_per) * 500.0 + util
+        if penalty < fallback_penalty:
+            fallback_penalty = penalty
+            fallback_policy = policy.copy()
+
+    return best_policy if best_policy is not None else fallback_policy
+
+
+def summarize_outputs(
+    records_by_snr: Dict[int, Dict[str, torch.Tensor]],
+    policy: Dict,
+    hybrid_cfg=None,
+    payload_symbols=None,
+):
+    """보정된 정책을 적용해 SNR별 SER / PER / utilization 통계를 계산한다."""
+
+    hybrid_cfg = CFG["hybrid"] if hybrid_cfg is None else hybrid_cfg
+    payload_symbols = CFG["experiment"]["payload_symbols"] if payload_symbols is None else payload_symbols
+    conf_type = hybrid_cfg["confidence_type"]
+    compiled_policy = None
     stats = {}
 
-    packet_size = CFG["packet_size"]
-    eval_batch_size = CFG["eval_batch_size"]
+    for snr, record in records_by_snr.items():
+        _validate_record(record)
+        labels = record["labels"]
+        pred_single = record["pred_single"]
+        pred_mh = record["pred_mh"]
+        pred_cnn = record["pred_cnn"]
+        confidence = record["confidence"]
 
-    # 평가에 사용할 다중 가설 격자를 만든다.
-    cfo_grid, to_grid = simulator.generate_hypothesis_grid(
-        max_cfo_hz,
-        CFG["max_to_samples"],
-        CFG["cfo_steps"],
-        CFG["to_steps"],
-    )
+        if compiled_policy is None:
+            compiled_policy = _materialize_policy(policy, confidence.device, confidence.dtype)
 
-    for snr, dataset in test_dict.items():
-        labels, rx_signals = dataset.tensors
-        labels, rx_signals = labels.to(device), rx_signals.to(device)
+        use_cnn = _policy_mask(confidence, compiled_policy, conf_type=conf_type)
+        pred_hybrid = torch.where(use_cnn, pred_cnn, pred_single)
 
-        num_samples = len(labels)
-        num_packets = num_samples // packet_size
-
-        # policy가 dict이면 현재 SNR에 해당하는 threshold를 사용한다.
-        # 아니면 같은 고정 threshold를 모든 SNR에 사용한다.
-        th = policy.get(snr, 1.5) if isinstance(policy, dict) else policy
-
-        pred_g_list, pred_c_list, conf_list = [], [], []
-
-        with torch.no_grad():
-            for i in range(0, num_samples, eval_batch_size):
-                end = min(i + eval_batch_size, num_samples)
-                rx_batch = rx_signals[i:end]
-
-                # classical grouped-bin 복조
-                grouped_energy, _ = simulator.baseline_grouped_bin(rx_batch)
-                pred_g_list.append(torch.argmax(grouped_energy, dim=1))
-                conf_list.append(get_confidence(grouped_energy, conf_type))
-
-                # CNN 복조
-                features = simulator.extract_multi_hypothesis_bank(
-                    rx_batch,
-                    cfo_grid,
-                    to_grid,
-                    CFG["patch_size"],
-                )
-                pred_c_list.append(torch.argmax(model(features), dim=1))
-
-            pred_g = torch.cat(pred_g_list)
-            pred_c = torch.cat(pred_c_list)
-            conf = torch.cat(conf_list)
-
-            # confidence와 threshold를 비교하여 CNN 사용 여부를 정한다.
-            use_cnn = (conf < th) if conf_type != 'entropy' else (conf > th)
-
-            # hybrid 결과를 만든다.
-            pred_h = torch.where(use_cnn, pred_c, pred_g)
-
-            # packet 단위 비교를 위해 packet_size 기준으로 reshape한다.
-            labels_pkt = labels.view(num_packets, packet_size)
-
-            stats[snr] = {
-                # baseline SER
-                "ser_g": 1.0 - (pred_g == labels).float().mean().item(),
-
-                # full CNN SER
-                "ser_c": 1.0 - (pred_c == labels).float().mean().item(),
-
-                # hybrid SER
-                "ser_h": 1.0 - (pred_h == labels).float().mean().item(),
-
-                # baseline PER
-                "per_g": (torch.any(labels_pkt != pred_g.view(num_packets, packet_size), dim=1)).float().mean().item(),
-
-                # full CNN PER
-                "per_c": (torch.any(labels_pkt != pred_c.view(num_packets, packet_size), dim=1)).float().mean().item(),
-
-                # hybrid PER
-                "per_h": (torch.any(labels_pkt != pred_h.view(num_packets, packet_size), dim=1)).float().mean().item(),
-
-                # 현재 SNR에서 CNN이 실제로 사용된 비율
-                "util": use_cnn.float().mean().item() * 100,
-
-                # 사용된 threshold 값
-                "th": th,
-            }
+        stats[snr] = {
+            "ser_single": _compute_sample_error_rate(labels, pred_single),
+            "ser_mh": _compute_sample_error_rate(labels, pred_mh),
+            "ser_c": _compute_sample_error_rate(labels, pred_cnn),
+            "ser_h": _compute_sample_error_rate(labels, pred_hybrid),
+            "per_single": _compute_packet_error_rate(labels, pred_single, payload_symbols),
+            "per_mh": _compute_packet_error_rate(labels, pred_mh, payload_symbols),
+            "per_c": _compute_packet_error_rate(labels, pred_cnn, payload_symbols),
+            "per_h": _compute_packet_error_rate(labels, pred_hybrid, payload_symbols),
+            "util": use_cnn.float().mean().item() * 100.0,
+        }
 
     return stats
+
+
+def calibrate_global_threshold(
+    model,
+    simulator,
+    calib_dict,
+    channel_profile,
+    feature_cfg=None,
+    eval_batch_size=None,
+    hybrid_cfg=None,
+    payload_symbols=None,
+):
+    """calibration dataset을 이용해 global threshold policy를 학습한다."""
+
+    outputs = collect_receiver_outputs(
+        model,
+        simulator,
+        calib_dict,
+        channel_profile,
+        feature_cfg=feature_cfg,
+        eval_batch_size=eval_batch_size,
+        hybrid_cfg=hybrid_cfg,
+    )
+    return calibrate_global_threshold_from_outputs(
+        outputs,
+        hybrid_cfg=hybrid_cfg,
+        payload_symbols=payload_symbols,
+    )
+
+
+def calibrate_confidence_bin_policy(
+    model,
+    simulator,
+    calib_dict,
+    channel_profile,
+    feature_cfg=None,
+    eval_batch_size=None,
+    hybrid_cfg=None,
+    payload_symbols=None,
+):
+    """calibration dataset을 이용해 confidence-bin policy를 학습한다."""
+
+    outputs = collect_receiver_outputs(
+        model,
+        simulator,
+        calib_dict,
+        channel_profile,
+        feature_cfg=feature_cfg,
+        eval_batch_size=eval_batch_size,
+        hybrid_cfg=hybrid_cfg,
+    )
+    return calibrate_confidence_bin_policy_from_outputs(
+        outputs,
+        hybrid_cfg=hybrid_cfg,
+        payload_symbols=payload_symbols,
+    )
+
+
+def run_evaluation(
+    model,
+    simulator,
+    test_dict,
+    channel_profile,
+    policy,
+    feature_cfg=None,
+    eval_batch_size=None,
+    hybrid_cfg=None,
+    payload_symbols=None,
+):
+    """주어진 정책으로 test dataset 전체를 평가해 통계를 반환한다."""
+
+    outputs = collect_receiver_outputs(
+        model,
+        simulator,
+        test_dict,
+        channel_profile,
+        feature_cfg=feature_cfg,
+        eval_batch_size=eval_batch_size,
+        hybrid_cfg=hybrid_cfg,
+    )
+    return summarize_outputs(
+        outputs,
+        policy,
+        hybrid_cfg=hybrid_cfg,
+        payload_symbols=payload_symbols,
+    )
+
+
+def benchmark_receivers(
+    model,
+    simulator,
+    reference_dataset,
+    channel_profile,
+    policy,
+    benchmark_cfg=None,
+    feature_cfg=None,
+    hybrid_cfg=None,
+):
+    """각 수신기 경로의 상대적 추론 시간을 측정한다.
+
+    여기서 측정하는 시간은 end-to-end 시스템 시간이라기보다,
+    동일한 환경에서 각 경로를 비교하기 위한 상대적 기준 시간에 가깝다.
+    """
+
+    benchmark_cfg = CFG["benchmark"] if benchmark_cfg is None else benchmark_cfg
+    feature_cfg = CFG["feature_bank"] if feature_cfg is None else feature_cfg
+    hybrid_cfg = CFG["hybrid"] if hybrid_cfg is None else hybrid_cfg
+    conf_type = hybrid_cfg["confidence_type"]
+
+    resolved_profile = simulator.resolve_channel_profile(channel_profile)
+    max_cfo_hz = get_max_cfo_hz(simulator, channel_profile)
+    cfo_grid, to_grid = simulator.generate_hypothesis_grid(
+        max_cfo_hz,
+        resolved_profile["max_to_samples"],
+        feature_cfg["cfo_steps"],
+        feature_cfg["to_steps"],
+    )
+    helper = simulator.prepare_hypothesis_helper(
+        cfo_grid,
+        to_grid,
+        feature_cfg["patch_size"],
+    )
+
+    _, rx_signals = reference_dataset.tensors
+    batch_size = min(benchmark_cfg["batch_size"], rx_signals.size(0))
+    rx_batch = rx_signals[:batch_size].to(simulator.device)
+    compiled_policy = _materialize_policy(policy, simulator.device, torch.float32)
+
+    def single_path():
+        """Default LoRa 경로만 실행한다."""
+
+        with torch.inference_mode():
+            simulator.baseline_grouped_bin(rx_batch, window_size=feature_cfg["baseline_window"])
+
+    def mh_path():
+        """Enhanced LoRa 경로만 실행한다."""
+
+        with torch.inference_mode():
+            simulator.multi_hypothesis_grouped_bin(
+                rx_batch,
+                helper=helper,
+                window_size=feature_cfg["baseline_window"],
+            )
+
+    def cnn_path():
+        """Full CNN 경로만 실행한다."""
+
+        with torch.inference_mode():
+            features = simulator.extract_multi_hypothesis_bank(
+                rx_batch,
+                helper=helper,
+            )
+            model(features)
+
+    def hybrid_path():
+        """하이브리드 경로를 실제 정책과 동일하게 실행한다."""
+
+        with torch.inference_mode():
+            grouped_single, _ = simulator.baseline_grouped_bin(
+                rx_batch,
+                window_size=feature_cfg["baseline_window"],
+            )
+            confidence = get_confidence(grouped_single, conf_type=conf_type)
+            use_cnn = _policy_mask(confidence, compiled_policy, conf_type=conf_type)
+            if torch.any(use_cnn):
+                features = simulator.extract_multi_hypothesis_bank(
+                    rx_batch[use_cnn],
+                    helper=helper,
+                )
+                model(features)
+
+    return {
+        "single_ms": benchmark_callable(
+            single_path,
+            simulator.device,
+            warmup=benchmark_cfg["warmup"],
+            repeats=benchmark_cfg["repeats"],
+        ),
+        "mh_ms": benchmark_callable(
+            mh_path,
+            simulator.device,
+            warmup=benchmark_cfg["warmup"],
+            repeats=benchmark_cfg["repeats"],
+        ),
+        "cnn_ms": benchmark_callable(
+            cnn_path,
+            simulator.device,
+            warmup=benchmark_cfg["warmup"],
+            repeats=benchmark_cfg["repeats"],
+        ),
+        "hybrid_ms": benchmark_callable(
+            hybrid_path,
+            simulator.device,
+            warmup=benchmark_cfg["warmup"],
+            repeats=benchmark_cfg["repeats"],
+        ),
+    }

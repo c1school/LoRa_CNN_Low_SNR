@@ -1,89 +1,166 @@
-# 이 파일은 실험에 사용되는 주요 설정값을 한곳에 모아 관리하는 파일이다.
-# 여러 파일에 흩어진 숫자를 한 번에 통제하기 위해 사용한다.
-# 이렇게 중앙에서 관리하면 실험 조건을 바꿀 때 실수를 줄일 수 있다.
+"""실험 전체에서 사용하는 기본 설정을 한 곳에 모아 둔 파일이다.
+
+이 파일은 다음 정보를 정의한다.
+
+- 어떤 SF / BW 조합을 실험할 것인지
+- feature bank를 어떤 해상도로 만들 것인지
+- 학습 배치 크기와 epoch 수는 얼마인지
+- 평가할 SNR 구간은 어디까지인지
+- 하이브리드 정책 보정 시 허용 오차는 얼마인지
+- 채널에 어떤 impairment를 어느 정도까지 넣을 것인지
+
+실행 중에는 `main.py`와 `colab_run.py`가 이 설정을 그대로 사용하거나,
+프로파일별 오버라이드를 덧씌워서 사용한다.
+"""
+
 
 CFG = {
-    # ------------------------------------------------------------
-    # 통신 물리 계층 설정
-    # ------------------------------------------------------------
-    # sf는 spreading factor를 의미한다.
-    # LoRa에서 한 심볼이 몇 개의 서로 다른 값 중 하나를 표현하는지를 결정한다.
-    # 심볼 개수 M은 2 ** sf로 계산된다.
-    "sf": 7,
-
-    # bw는 대역폭을 의미한다.
-    # 단위는 Hz이며, 여기서는 125 kHz를 사용한다.
-    "bw": 125e3,
-
-    # fs는 샘플링 주파수를 의미한다.
-    # 시뮬레이터가 한 초에 몇 개의 샘플을 만들지를 결정한다.
-    "fs": 1e6,
-
-    # ------------------------------------------------------------
-    # 다중 가설 특징맵 생성 설정
-    # ------------------------------------------------------------
-    # max_cfo_bins는 CFO를 bin 단위로 어느 정도까지 허용할지를 정한다.
-    # 실제 Hz 값은 코드 내부에서 bw / M을 곱해 변환한다.
-    "max_cfo_bins": 0.35,
-
-    # patch_size는 각 심볼 중심 bin 주변에서 몇 개의 주파수 bin을 함께 볼지를 정한다.
-    # 값이 5이면 중심을 포함하여 좌우 2개씩, 총 5개 bin을 함께 본다.
-    # 이 값이 커질수록 peak 주변의 퍼짐 구조를 더 자세히 볼 수 있으나,
-    # 입력 차원이 커져 연산량과 메모리 사용량도 증가한다.
-    "patch_size": 5,
-
-    # cfo_steps는 CFO 가설을 몇 개 둘지를 정한다.
-    # 값이 17이면 CFO 후보를 17개로 나누어 각각 보정해 본다.
-    "cfo_steps": 17,
-
-    # to_steps는 timing offset 가설을 몇 개 둘지를 정한다.
-    # 값이 9이면 timing 후보를 9개로 나누어 각각 확인한다.
-    "to_steps": 9,
-
-    # max_to_samples는 timing offset 가설의 최대 이동 샘플 수를 의미한다.
-    # 예를 들어 값이 4이면 -4부터 +4까지의 정수 이동을 가설로 만든다.
-    "max_to_samples": 4,
-
-    # ------------------------------------------------------------
-    # 학습 및 평가 하이퍼파라미터
-    # ------------------------------------------------------------
-    # train_batch_size는 학습 시 한 번에 처리할 샘플 수를 의미한다.
-    # 값이 커질수록 GPU를 효율적으로 쓸 수 있으나 메모리 사용량이 늘어난다.
-    "train_batch_size": 64,
-
-    # eval_batch_size는 검증 및 평가 시 한 번에 처리할 샘플 수를 의미한다.
-    # 학습보다 큰 값을 쓰기도 하나, 메모리를 고려하여 따로 설정한다.
-    "eval_batch_size": 128,
-
-    # num_epochs는 전체 학습 데이터를 몇 번 반복해 학습할지를 정한다.
-    "num_epochs": 25,
-
-    # learning_rate는 Adam 옵티마이저가 한 번 업데이트할 때 얼마나 크게 이동할지를 정한다.
-    "learning_rate": 0.0005,
-
-    # packet_size는 평가 시 몇 개의 심볼을 한 패킷으로 묶어 PER을 계산할지를 정한다.
-    # 여기서는 실제 LoRa 패킷 전체를 그대로 재현한 것은 아니고,
-    # 연구용 비교 지표를 만들기 위해 고정 길이의 심볼 묶음을 사용한다.
-    "packet_size": 20,
-
-    # ------------------------------------------------------------
-    # 실험 환경 설정
-    # ------------------------------------------------------------
-    # seeds는 반복 실험에 사용할 난수 시드 목록이다.
-    # 한 번만 실행하면 우연 효과를 배제하기 어려우므로 여러 시드로 반복한다.
-    "seeds": [2024, 2025, 2026],
-
-    # test_snrs는 최종 성능을 확인할 SNR 목록이다.
-    # ultra-low SNR 구간을 집중적으로 보기 위해 음수 값 위주로 설정하였다.
-    "test_snrs": [-21, -19, -17, -15, -13],
-
-    # calib_samples는 adaptive threshold를 보정할 때 사용할 샘플 수이다.
-    "calib_samples": 8000,
-
-    # test_samples는 최종 성능 평가에 사용할 샘플 수이다.
-    "test_samples": 10000,
-
-    # train_samples는 학습용으로 사용할 전체 파라미터 샘플 수이다.
-    # 실제 파형은 이 파라미터를 바탕으로 온라인으로 생성된다.
-    "train_samples": 40000,
+    # 수신기 프로파일 목록이다.
+    # 각 항목은 하나의 독립적인 실험 동작점으로 취급된다.
+    "receiver_profiles": [
+        {"name": "sf7_bw125", "sf": 7, "bw": 125e3, "fs": 1e6},
+        {
+            "name": "sf8_bw125",
+            "sf": 8,
+            "bw": 125e3,
+            "fs": 1e6,
+            # 큰 SF에서 학습 난이도가 더 높으므로 기본값보다 학습 예산을 늘린다.
+            "training_overrides": {
+                "train_batch_size": 32,
+                "eval_batch_size": 64,
+                "num_epochs": 30,
+            },
+            "experiment_overrides": {
+                "train_samples": 96000,
+            },
+            # 분류 클래스 수가 늘어나므로 모델 폭도 약간 키운다.
+            "model_overrides": {
+                "width_scale": 1.25,
+                "classifier_hidden": 384,
+            },
+        },
+        {
+            "name": "sf9_bw250",
+            "sf": 9,
+            "bw": 250e3,
+            "fs": 2e6,
+            # SF9는 feature 크기와 분류 난이도가 모두 커서 배치를 더 작게 잡는다.
+            "training_overrides": {
+                "train_batch_size": 8,
+                "eval_batch_size": 16,
+                "num_epochs": 40,
+            },
+            "experiment_overrides": {
+                "train_samples": 192000,
+            },
+            "model_overrides": {
+                "width_scale": 1.5,
+                "classifier_hidden": 512,
+            },
+        },
+    ],
+    # CNN 구조의 기본 크기다.
+    # 프로파일별 override가 있으면 그 값을 우선 사용한다.
+    "model": {
+        "width_scale": 1.0,
+        "classifier_hidden": 256,
+        "dropout": 0.3,
+        "stage_channels": [32, 64, 96, 128],
+    },
+    # 다중 가설 feature bank를 만들 때 사용하는 설정이다.
+    "feature_bank": {
+        "patch_size": 5,
+        "cfo_steps": 17,
+        "to_steps": 9,
+        "baseline_window": 2,
+    },
+    # 학습 루프 기본 설정이다.
+    "training": {
+        "train_batch_size": 64,
+        "eval_batch_size": 128,
+        "num_epochs": 20,
+        "learning_rate": 5e-4,
+        "weight_decay": 1e-4,
+    },
+    # 데이터 개수와 평가 SNR 구간을 정의한다.
+    "experiment": {
+        "payload_symbols": 16,
+        "train_samples": 48000,
+        "val_packets": 256,
+        "calib_packets": 300,
+        "test_packets": 500,
+        "seeds": [2024, 2025, 2026],
+        "train_snr_range": (-23.0, -5.0),
+        # 그래프를 더 촘촘하게 보기 위해 -21 dB부터 0 dB까지 1 dB 간격으로 평가한다.
+        "test_snrs": list(range(-21, 1)),
+    },
+    # 하이브리드 정책 보정에 사용되는 설정이다.
+    "hybrid": {
+        "confidence_type": "ratio",
+        "global_threshold_grid": 81,
+        "confidence_bins": 10,
+        "ser_tolerance": 0.005,
+        "per_tolerance": 0.01,
+    },
+    # 상대적인 추론 지연시간을 재는 데 사용하는 설정이다.
+    "benchmark": {
+        "warmup": 2,
+        "repeats": 6,
+        "batch_size": 64,
+    },
+    # 학습 중 최적 모델을 저장하는 경로와 저장 여부를 정의한다.
+    "artifacts": {
+        "save_best_weights": True,
+        "save_best_checkpoint": True,
+        "weights_dir": "artifacts/weights",
+        "checkpoints_dir": "artifacts/checkpoints",
+    },
+    # 외부에서 측정한 IQ 데이터를 평가에 쓰고 싶을 때 `.npz` 경로를 넣을 수 있다.
+    "recorded_eval_npz": [],
+    # 채널 프로파일 정의다.
+    # train / seen_eval / unseen_eval 세 가지 분포를 나누어 사용한다.
+    "channel_profiles": {
+        "train": {
+            "max_cfo_bins": 0.45,
+            "max_to_samples": 4,
+            "max_to_symbol_fraction": 4 / 1024,
+            "max_fractional_to_samples": 0.35,
+            "max_paths": 4,
+            "max_delay_samples": 18,
+            "max_delay_symbol_fraction": 18 / 1024,
+            "delay_decay": 5.0,
+            "extra_path_prob": 0.75,
+            "phase_noise_std_range": (0.0004, 0.0018),
+            "tone_interference_prob": 0.20,
+            "tone_inr_db_range": (-12.0, 4.0),
+        },
+        "seen_eval": {
+            "max_cfo_bins": 0.45,
+            "max_to_samples": 4,
+            "max_to_symbol_fraction": 4 / 1024,
+            "max_fractional_to_samples": 0.35,
+            "max_paths": 4,
+            "max_delay_samples": 18,
+            "max_delay_symbol_fraction": 18 / 1024,
+            "delay_decay": 5.0,
+            "extra_path_prob": 0.75,
+            "phase_noise_std_range": (0.0004, 0.0018),
+            "tone_interference_prob": 0.20,
+            "tone_inr_db_range": (-12.0, 4.0),
+        },
+        "unseen_eval": {
+            "max_cfo_bins": 0.75,
+            "max_to_samples": 8,
+            "max_to_symbol_fraction": 8 / 1024,
+            "max_fractional_to_samples": 0.70,
+            "max_paths": 5,
+            "max_delay_samples": 28,
+            "max_delay_symbol_fraction": 28 / 1024,
+            "delay_decay": 9.0,
+            "extra_path_prob": 0.90,
+            "phase_noise_std_range": (0.0015, 0.0040),
+            "tone_interference_prob": 0.45,
+            "tone_inr_db_range": (-6.0, 9.0),
+        },
+    },
 }
