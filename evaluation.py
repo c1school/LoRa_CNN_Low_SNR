@@ -129,11 +129,13 @@ def collect_receiver_outputs(
     - Default LoRa confidence
     """
 
+    # 별도 설정을 넘기지 않으면 전역 기본 설정을 사용한다.
     feature_cfg = CFG["feature_bank"] if feature_cfg is None else feature_cfg
     eval_batch_size = CFG["training"]["eval_batch_size"] if eval_batch_size is None else eval_batch_size
     hybrid_cfg = CFG["hybrid"] if hybrid_cfg is None else hybrid_cfg
     conf_type = hybrid_cfg["confidence_type"]
 
+    # 현재 채널 프로파일과 feature bank 설정에 맞춰 hypothesis helper를 준비한다.
     resolved_profile = simulator.resolve_channel_profile(channel_profile)
     max_cfo_hz = get_max_cfo_hz(simulator, channel_profile)
     cfo_grid, to_grid = simulator.generate_hypothesis_grid(
@@ -151,6 +153,7 @@ def collect_receiver_outputs(
     outputs = {}
     model.eval()
     with torch.inference_mode():
+        # dataset_dict는 {snr: TensorDataset} 형태이므로 SNR별로 따로 결과를 모은다.
         for snr in sorted(dataset_dict):
             labels, rx_signals = dataset_dict[snr].tensors
             labels = labels.to(simulator.device)
@@ -161,6 +164,7 @@ def collect_receiver_outputs(
             pred_cnn = []
             confidence = []
 
+            # 추론도 메모리를 고려해 배치 단위로 나누어 수행한다.
             for start in range(0, labels.size(0), eval_batch_size):
                 end = min(start + eval_batch_size, labels.size(0))
                 rx_batch = rx_signals[start:end]
@@ -183,6 +187,7 @@ def collect_receiver_outputs(
                 pred_mh.append(torch.argmax(mh_scores, dim=1))
                 pred_cnn.append(torch.argmax(model(features), dim=1))
 
+            # GPU 메모리 점유를 줄이기 위해 결과는 CPU로 내려 저장한다.
             record = {
                 "labels": labels.cpu(),
                 "pred_single": torch.cat(pred_single).cpu(),
@@ -210,6 +215,7 @@ def calibrate_global_threshold_from_outputs(
     payload_symbols = CFG["experiment"]["payload_symbols"] if payload_symbols is None else payload_symbols
     conf_type = hybrid_cfg["confidence_type"]
 
+    # 여러 SNR calibration 데이터를 한데 합쳐 threshold 하나를 고른다.
     records = _flatten_outputs(records_by_snr)
     labels = records["labels"]
     pred_single = records["pred_single"]
@@ -221,6 +227,7 @@ def calibrate_global_threshold_from_outputs(
     target_ser = ser_c + hybrid_cfg["ser_tolerance"]
     target_per = per_c + hybrid_cfg["per_tolerance"]
 
+    # confidence 분포의 분위수 기반 후보 threshold를 만든다.
     candidate_grid = torch.linspace(
         0.0,
         1.0,
@@ -235,6 +242,8 @@ def calibrate_global_threshold_from_outputs(
     fallback_penalty = float("inf")
 
     for threshold in thresholds:
+        # threshold에 따라 CNN 사용 여부를 정하고,
+        # 그때의 SER / PER / CNN 사용률을 계산한다.
         use_cnn = (confidence > threshold) if conf_type == "entropy" else (confidence < threshold)
         pred_hybrid = torch.where(use_cnn, pred_cnn, pred_single)
 
@@ -251,6 +260,8 @@ def calibrate_global_threshold_from_outputs(
             fallback_penalty = penalty
             fallback_policy = {"mode": "threshold", "threshold": float(threshold.item())}
 
+    # 목표 SER/PER를 만족하는 가장 싼 정책이 있으면 그것을,
+    # 없으면 penalty가 가장 작은 대체 정책을 사용한다.
     return best_policy if best_policy is not None else fallback_policy
 
 
@@ -276,6 +287,7 @@ def calibrate_confidence_bin_policy_from_outputs(
     target_ser = ser_c + hybrid_cfg["ser_tolerance"]
     target_per = per_c + hybrid_cfg["per_tolerance"]
 
+    # confidence를 분위수 기반 bin으로 나누어 구간별 정책을 만든다.
     quantiles = torch.linspace(
         0.0,
         1.0,
@@ -306,6 +318,7 @@ def calibrate_confidence_bin_policy_from_outputs(
     fallback_penalty = float("inf")
 
     use_cnn_by_bin = torch.zeros(num_bins, dtype=torch.bool, device=confidence.device)
+    # confidence가 낮은 쪽부터 차례로 CNN을 켰을 때의 성능을 평가한다.
     for cutoff in range(num_bins + 1):
         if cutoff > 0:
             use_cnn_by_bin[ordered_bins[cutoff - 1]] = True
@@ -359,6 +372,7 @@ def summarize_outputs(
         if compiled_policy is None:
             compiled_policy = _materialize_policy(policy, confidence.device, confidence.dtype)
 
+        # 실제 하이브리드 예측은 "CNN을 쓸 샘플만 CNN 결과 사용, 나머지는 기본 복조기 사용"으로 만든다.
         use_cnn = _policy_mask(confidence, compiled_policy, conf_type=conf_type)
         pred_hybrid = torch.where(use_cnn, pred_cnn, pred_single)
 
@@ -549,25 +563,25 @@ def benchmark_receivers(
     return {
         "single_ms": benchmark_callable(
             single_path,
-            simulator.device,
+            device=simulator.device,
             warmup=benchmark_cfg["warmup"],
             repeats=benchmark_cfg["repeats"],
         ),
         "mh_ms": benchmark_callable(
             mh_path,
-            simulator.device,
+            device=simulator.device,
             warmup=benchmark_cfg["warmup"],
             repeats=benchmark_cfg["repeats"],
         ),
         "cnn_ms": benchmark_callable(
             cnn_path,
-            simulator.device,
+            device=simulator.device,
             warmup=benchmark_cfg["warmup"],
             repeats=benchmark_cfg["repeats"],
         ),
         "hybrid_ms": benchmark_callable(
             hybrid_path,
-            simulator.device,
+            device=simulator.device,
             warmup=benchmark_cfg["warmup"],
             repeats=benchmark_cfg["repeats"],
         ),

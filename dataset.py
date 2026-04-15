@@ -67,8 +67,11 @@ def _build_packet_parameters(
     """
 
     device = simulator.device
+    # CFO 범위는 채널 프로파일의 `max_cfo_bins`를 현재 SF/BW에 맞는 Hz로 바꿔 계산한다.
     max_cfo_hz = get_max_cfo_hz(simulator, channel_profile)
 
+    # labels:
+    # 각 패킷의 각 payload symbol이 어떤 LoRa 심볼 값을 가지는지 나타낸다.
     labels = torch.randint(
         0,
         simulator.M,
@@ -76,18 +79,24 @@ def _build_packet_parameters(
         generator=generator,
         device=device,
     )
+    # snrs:
+    # 각 패킷 전체에 공통으로 적용할 SNR이다.
     snrs = (
         torch.rand(num_packets, generator=generator, device=device)
         * (snr_range[1] - snr_range[0])
         + snr_range[0]
     )
+    # cfos:
+    # 각 패킷 전체에 공통으로 적용할 residual CFO다.
     cfos = (
         torch.rand(num_packets, generator=generator, device=device)
         * (2 * max_cfo_hz)
         - max_cfo_hz
     )
 
+    # 채널 상태도 패킷 단위로 먼저 샘플링한다.
     channel_state_pkt = simulator.sample_channel_state(num_packets, channel_profile, generator=generator)
+    # 이후 payload symbol 개수만큼 반복해 심볼 단위 텐서로 펼친다.
     channel_state = simulator.repeat_channel_state(channel_state_pkt, payload_symbols)
 
     return labels, snrs, cfos, channel_state
@@ -115,6 +124,7 @@ def create_fixed_feature_dataset(
     payload_symbols = experiment_cfg["payload_symbols"]
     resolved_profile = simulator.resolve_channel_profile(channel_profile)
 
+    # seed를 고정해 동일한 고정 dataset을 다시 만들 수 있게 한다.
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
 
@@ -140,6 +150,7 @@ def create_fixed_feature_dataset(
         feature_cfg["patch_size"],
     )
 
+    # 최종 feature tensor의 크기를 미리 알고 있으므로 empty tensor를 선할당한다.
     num_samples = num_packets * payload_symbols
     num_hypotheses = feature_cfg["cfo_steps"] * feature_cfg["to_steps"]
     num_bins = simulator.M * feature_cfg["patch_size"]
@@ -148,6 +159,7 @@ def create_fixed_feature_dataset(
     labels_flat = labels.reshape(-1).cpu()
 
     with torch.no_grad():
+        # 메모리 사용량을 줄이기 위해 packet 단위 chunk로 나눠 생성한다.
         chunk_packets = 32
         write_ptr = 0
         for pkt_start in range(0, num_packets, chunk_packets):
@@ -206,6 +218,7 @@ def create_fixed_waveform_range_dataset(
         generator=gen,
     )
 
+    # TensorDataset은 심볼 단위로 다루기 때문에 [num_packets, payload_symbols]를 평탄화한다.
     labels_flat = labels.reshape(-1).cpu()
     waveforms = torch.empty((num_packets * payload_symbols, simulator.N), dtype=torch.complex64)
 
@@ -259,8 +272,10 @@ def create_fixed_waveform_dataset(
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
 
+    # SNR별로 별도 dataset을 만들어 딕셔너리에 저장한다.
     datasets = {}
     for snr in snr_list:
+        # 각 SNR 값에 대해 정확히 그 SNR만 갖는 패킷들을 생성한다.
         labels, _, cfos, channel_state = _build_packet_parameters(
             simulator,
             num_packets_per_snr,
@@ -306,6 +321,7 @@ def create_fixed_waveform_dataset(
 def load_recorded_waveform_dataset(npz_path: str, expected_num_samples: int = None):
     """외부에서 저장한 recorded IQ `.npz` 파일을 TensorDataset으로 읽어온다."""
 
+    # npz 안에서 labels와 IQ 성분을 읽어 TensorDataset 형태로 바꾼다.
     data = np.load(npz_path)
     labels = torch.from_numpy(data["labels"]).long()
 

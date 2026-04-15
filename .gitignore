@@ -15,3 +15,4 @@ env/
 Thumbs.db
 *.csv
 colab_run.py
+plot_from_csv.py
