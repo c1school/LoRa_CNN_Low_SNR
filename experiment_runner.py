@@ -95,7 +95,8 @@ def _load_model_from_checkpoint(model, checkpoint_path, device):
 
 
 def _build_datasets(simulator, experiment_cfg, channel_profiles, seed):
-    """validation, calibration, seen test, unseen test 데이터셋을 만든다."""
+    """validation, calibration, seen test, unseen test dataset을 만든다."""
+    shared_channel_state_across_snr = experiment_cfg.get("shared_channel_state_across_snr", False)
 
     # ds_val:
     # train SNR 범위를 대표하는 validation waveform 데이터셋이다.
@@ -117,6 +118,7 @@ def _build_datasets(simulator, experiment_cfg, channel_profiles, seed):
         channel_profile=channel_profiles["seen_eval"],
         seed=seed + 1,
         experiment_cfg=experiment_cfg,
+        shared_channel_state_across_snr=shared_channel_state_across_snr,
     )
 
     # ds_test_seen:
@@ -128,6 +130,7 @@ def _build_datasets(simulator, experiment_cfg, channel_profiles, seed):
         channel_profile=channel_profiles["seen_eval"],
         seed=seed + 2,
         experiment_cfg=experiment_cfg,
+        shared_channel_state_across_snr=shared_channel_state_across_snr,
     )
 
     # ds_test_unseen:
@@ -139,6 +142,7 @@ def _build_datasets(simulator, experiment_cfg, channel_profiles, seed):
         channel_profile=channel_profiles["unseen_eval"],
         seed=seed + 3,
         experiment_cfg=experiment_cfg,
+        shared_channel_state_across_snr=shared_channel_state_across_snr,
     )
     return ds_val, ds_calib, ds_test_seen, ds_test_unseen
 

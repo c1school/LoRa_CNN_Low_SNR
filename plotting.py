@@ -23,7 +23,6 @@ SER_DISPLAY_FLOOR = 1e-6
 # 여러 선이 겹쳐도 완전히 묻히지 않도록 곡선별 투명도를 다르게 준다.
 LINE_ALPHA = {
     "default_lora": 0.75,
-    "enhanced_lora": 0.75,
     "full_cnn": 0.75,
     "hybrid_cnn": 0.95,
     "cnn_utilization": 0.85,
@@ -55,7 +54,7 @@ def _configure_ser_axis(ax1, ax2):
     ax2.set_ylim([-5, 105])
 
 
-def plot_summary(summary_df, graph_dir: str = GRAPH_DIR):
+def plot_summary(summary_df, graph_dir: str = GRAPH_DIR, filename_suffix: str = ""):
     """프로파일별 최종 성능 비교 그래프를 저장한다."""
 
     # 저장 폴더가 없으면 먼저 만든다.
@@ -87,16 +86,6 @@ def plot_summary(summary_df, graph_dir: str = GRAPH_DIR):
                 color="black",
                 marker="x",
                 alpha=LINE_ALPHA["default_lora"],
-            )
-
-            # Enhanced LoRa SER 곡선
-            ax1.semilogy(
-                data["snr"],
-                _clip_ser(data["ser_mh_mean"]),
-                label="Enhanced LoRa",
-                color="blue",
-                marker="s",
-                alpha=LINE_ALPHA["enhanced_lora"],
             )
 
             # Full CNN SER 곡선
@@ -159,14 +148,17 @@ def plot_summary(summary_df, graph_dir: str = GRAPH_DIR):
 
             plt.title(f"{profile_name}: {title_suffix}")
             plt.savefig(
-                os.path.join(graph_dir, f"{profile_name}_summary_{channel_type}.png"),
+                os.path.join(
+                    graph_dir,
+                    f"{profile_name}_summary_{channel_type}{filename_suffix}.png",
+                ),
                 dpi=300,
                 bbox_inches="tight",
             )
             plt.close()
 
 
-def plot_policy_ablation(summary_df, graph_dir: str = GRAPH_DIR):
+def plot_policy_ablation(summary_df, graph_dir: str = GRAPH_DIR, filename_suffix: str = ""):
     """Global threshold policy와 confidence-bin policy를 비교하는 그래프를 저장한다."""
 
     os.makedirs(graph_dir, exist_ok=True)
@@ -262,7 +254,10 @@ def plot_policy_ablation(summary_df, graph_dir: str = GRAPH_DIR):
 
             plt.title(f"{profile_name}: Global vs Confidence-bin ({title_suffix})")
             plt.savefig(
-                os.path.join(graph_dir, f"{profile_name}_ablation_{channel_type}.png"),
+                os.path.join(
+                    graph_dir,
+                    f"{profile_name}_ablation_{channel_type}{filename_suffix}.png",
+                ),
                 dpi=300,
                 bbox_inches="tight",
             )

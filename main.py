@@ -1,17 +1,27 @@
-"""전체 실행 순서를 담당하는 진입점 파일이다.
+"""프로젝트 실행 진입점이다.
 
-이 파일의 역할은 "무엇을 어떤 순서로 호출할지"를 정리하는 것이다.
-세부 구현은 다른 모듈로 분리되어 있으므로,
-이 파일만 읽으면 프로그램 상위 흐름을 빠르게 파악할 수 있다.
+직접 `python main.py`로 실행하면
+1. 실행할 프로파일
+2. 평가 데이터 생성 방식
+3. 저장된 시드 또는 랜덤 시드
+를 차례로 선택한다.
+
+다른 스크립트에서 `import main; main.main(...)`으로 호출하면
+interactive 프롬프트 없이 override 값만 적용해 사용할 수 있다.
 """
+
+import copy
+from datetime import datetime
+import os
+import random
+import re
 
 import torch
 
 from config import CFG
 from experiment_runner import build_profile_runtime_configs, run_profile_seed
-from plotting import GRAPH_DIR, plot_policy_ablation, plot_summary
+from plotting import plot_policy_ablation, plot_summary
 from results_io import (
-    CSV_DIR,
     build_experiment_summary,
     build_latency_summary,
     save_experiment_summary_csv,
@@ -19,47 +29,268 @@ from results_io import (
 )
 
 
-def main():
-    """설정된 모든 수신기 프로파일에 대해 학습과 평가를 수행한다."""
+def _select_eval_mode():
+    """평가 데이터 생성 방식을 선택한다."""
 
-    # base_* 변수들은 config.py에 정의된 전역 기본 설정이다.
-    # 각 receiver_profile은 필요할 때 이 기본값 위에 override를 덮어쓴다.
-    base_experiment_cfg = CFG["experiment"]
+    print("평가 방식을 선택하세요.")
+    print("  1. SNR마다 독립 realization")
+    print("  2. 같은 channel state를 SNR 전 구간에서 재사용")
+
+    while True:
+        selected = input("입력 (1-2): ").strip()
+        if selected == "1":
+            print("-> SNR마다 독립 realization으로 평가합니다.")
+            return False
+        if selected == "2":
+            print("-> 같은 channel state를 SNR 전 구간에서 재사용합니다.")
+            return True
+        print("1 또는 2를 입력해야 합니다.")
+
+
+def _select_profiles(receiver_profiles):
+    """실행할 프로파일 범위를 선택한다."""
+
+    print("실행할 프로파일을 선택하세요.")
+    for idx, profile in enumerate(receiver_profiles, start=1):
+        print(f"  {idx}. {profile['name']}")
+    all_option = len(receiver_profiles) + 1
+    print(f"  {all_option}. 전체")
+
+    while True:
+        selected = input(f"입력 (1-{all_option}): ").strip()
+        if not selected.isdigit():
+            print("숫자를 입력해야 합니다.")
+            continue
+
+        selected_idx = int(selected)
+        if 1 <= selected_idx <= len(receiver_profiles):
+            chosen_profile = receiver_profiles[selected_idx - 1]
+            print(f"-> {chosen_profile['name']}만 실행합니다.")
+            return [chosen_profile]
+        if selected_idx == all_option:
+            print("-> 모든 프로파일을 실행합니다.")
+            return receiver_profiles
+
+        print(f"1부터 {all_option} 사이 숫자를 입력해야 합니다.")
+
+
+def _discover_saved_artifacts(receiver_profiles, artifact_cfg):
+    """선택한 프로파일들에 대해 저장된 artifact와 공통 저장 시드를 찾는다."""
+
+    profile_names = {profile["name"] for profile in receiver_profiles}
+    weights_dir = artifact_cfg.get("weights_dir", "artifacts/weights")
+    checkpoints_dir = artifact_cfg.get("checkpoints_dir", "artifacts/checkpoints")
+
+    weights_pattern = re.compile(r"^(?P<profile>.+)_seed(?P<seed>\d+)_best_weights\.pth$")
+    checkpoint_pattern = re.compile(r"^(?P<profile>.+)_seed(?P<seed>\d+)_best_checkpoint\.pt$")
+
+    artifacts_by_profile = {name: {} for name in profile_names}
+
+    if os.path.isdir(weights_dir):
+        for filename in os.listdir(weights_dir):
+            match = weights_pattern.match(filename)
+            if not match:
+                continue
+            profile_name = match.group("profile")
+            if profile_name not in profile_names:
+                continue
+            seed = int(match.group("seed"))
+            artifacts_by_profile[profile_name][seed] = os.path.abspath(os.path.join(weights_dir, filename))
+
+    if os.path.isdir(checkpoints_dir):
+        for filename in os.listdir(checkpoints_dir):
+            match = checkpoint_pattern.match(filename)
+            if not match:
+                continue
+            profile_name = match.group("profile")
+            if profile_name not in profile_names:
+                continue
+            seed = int(match.group("seed"))
+            artifacts_by_profile[profile_name].setdefault(
+                seed,
+                os.path.abspath(os.path.join(checkpoints_dir, filename)),
+            )
+
+    if artifacts_by_profile:
+        seed_sets = [set(profile_artifacts.keys()) for profile_artifacts in artifacts_by_profile.values()]
+        common_saved_seeds = sorted(set.intersection(*seed_sets)) if seed_sets else []
+    else:
+        common_saved_seeds = []
+
+    return artifacts_by_profile, common_saved_seeds
+
+
+def _select_seed(saved_seeds):
+    """저장된 시드 또는 랜덤 시드 중 하나를 선택한다."""
+
+    if not saved_seeds:
+        print("선택한 프로파일 조합에 공통으로 저장된 가중치가 없습니다.")
+        print("  1. 랜덤 시드로 새 학습 시작")
+        print("  2. 종료")
+
+        while True:
+            selected = input("입력 (1-2): ").strip()
+            if selected == "1":
+                generated_seed = random.SystemRandom().randint(1000, 999999)
+                print(f"-> 랜덤 시드 {generated_seed}로 새 학습을 시작합니다.")
+                return generated_seed, False
+            if selected == "2":
+                print("-> 실행을 종료합니다.")
+                return None, None
+            print("1 또는 2를 입력해야 합니다.")
+
+    print("저장된 가중치 시드를 선택하세요.")
+    for idx, seed in enumerate(saved_seeds, start=1):
+        print(f"  {idx}. {seed}")
+    random_option = len(saved_seeds) + 1
+    print(f"  {random_option}. 랜덤 시드")
+
+    while True:
+        selected = input(f"입력 (1-{random_option}): ").strip()
+        if not selected.isdigit():
+            print("숫자를 입력해야 합니다.")
+            continue
+
+        selected_idx = int(selected)
+        if 1 <= selected_idx <= len(saved_seeds):
+            selected_seed = saved_seeds[selected_idx - 1]
+            print(f"-> 저장된 시드 {selected_seed}를 사용합니다.")
+            return selected_seed, True
+        if selected_idx == random_option:
+            generated_seed = random.SystemRandom().randint(1000, 999999)
+            print(f"-> 랜덤 시드 {generated_seed}를 사용합니다.")
+            return generated_seed, False
+
+        print(f"1부터 {random_option} 사이 숫자를 입력해야 합니다.")
+
+
+def _profile_output_dir(profile_name, shared_channel_state):
+    """프로파일 이름과 평가 방식으로 결과 저장 폴더를 만든다."""
+
+    sf_dir = profile_name.split("_")[0]
+    mode_dir = "shared_channel_state" if shared_channel_state else "independent_realization"
+    return os.path.join(sf_dir, mode_dir)
+
+
+def _save_outputs_by_profile(summary, latency_summary, receiver_profiles, shared_channel_state):
+    """프로파일별 폴더에 CSV와 그래프를 각각 저장한다."""
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    saved_dirs = []
+
+    for receiver_profile in receiver_profiles:
+        profile_name = receiver_profile["name"]
+        profile_summary = summary[summary["profile"] == profile_name]
+        if profile_summary.empty:
+            continue
+
+        profile_latency = latency_summary[latency_summary["profile"] == profile_name]
+        output_dir = _profile_output_dir(profile_name, shared_channel_state)
+
+        save_experiment_summary_csv(
+            profile_summary,
+            csv_dir=output_dir,
+            filename=f"experiment_summary_{timestamp}.csv",
+        )
+        if not profile_latency.empty:
+            save_latency_summary_csv(
+                profile_latency,
+                csv_dir=output_dir,
+                filename=f"latency_summary_{timestamp}.csv",
+            )
+
+        plot_summary(
+            profile_summary,
+            graph_dir=output_dir,
+            filename_suffix=f"_{timestamp}",
+        )
+        plot_policy_ablation(
+            profile_summary,
+            graph_dir=output_dir,
+            filename_suffix=f"_{timestamp}",
+        )
+        saved_dirs.append(output_dir)
+
+    return timestamp, saved_dirs
+
+
+def main(
+    shared_channel_state_override=None,
+    seed_override=None,
+    interactive=False,
+    allow_training_without_saved_artifact=False,
+    same_realization_override=None,
+):
+    """설정된 수신기 프로파일들에 대해 학습/평가를 수행한다."""
+
+    # 이전 호출 코드 호환용 alias다.
+    if shared_channel_state_override is None and same_realization_override is not None:
+        shared_channel_state_override = same_realization_override
+
     base_train_cfg = CFG["training"]
     base_feature_cfg = CFG["feature_bank"]
     base_model_cfg = CFG.get("model", {})
     base_benchmark_cfg = CFG["benchmark"]
-
-    # artifact_cfg:
-    # best weights / checkpoint 저장 위치와 저장 여부를 담는다.
     artifact_cfg = CFG.get("artifacts", {})
-
-    # hybrid_cfg:
-    # confidence 계산 방식과 tolerance 기준 등 하이브리드 정책 보정 설정이다.
     hybrid_cfg = CFG["hybrid"]
-
-    # channel_profiles:
-    # train / seen_eval / unseen_eval 채널 분포를 담는다.
     channel_profiles = CFG["channel_profiles"]
 
-    # pin_memory:
-    # GPU 환경이면 DataLoader에서 pinned memory를 써서 host-to-device 복사를 조금 더 빠르게 한다.
+    receiver_profiles = CFG["receiver_profiles"]
+    selected_receiver_profiles = receiver_profiles
+
+    if interactive and shared_channel_state_override is None:
+        selected_receiver_profiles = _select_profiles(receiver_profiles)
+        shared_channel_state_override = _select_eval_mode()
+    elif interactive:
+        selected_receiver_profiles = _select_profiles(receiver_profiles)
+
+    artifacts_by_profile, saved_seeds = _discover_saved_artifacts(selected_receiver_profiles, artifact_cfg)
+
+    selected_saved_seed = False
+    if interactive and seed_override is None:
+        seed_override, selected_saved_seed = _select_seed(saved_seeds)
+        if seed_override is None and selected_saved_seed is None:
+            return
+    elif seed_override is not None:
+        requested_seed = int(seed_override)
+        selected_saved_seed = all(
+            requested_seed in artifacts_by_profile.get(profile["name"], {})
+            for profile in selected_receiver_profiles
+        )
+        if not selected_saved_seed and not allow_training_without_saved_artifact:
+            raise RuntimeError(
+                f"Seed {requested_seed} does not exist for every selected profile. "
+                "Use an interactive random seed or set allow_training_without_saved_artifact=True."
+            )
+
+    base_experiment_cfg = dict(CFG["experiment"])
+    if shared_channel_state_override is not None:
+        base_experiment_cfg["shared_channel_state_across_snr"] = shared_channel_state_override
+    if seed_override is not None:
+        base_experiment_cfg["seeds"] = [int(seed_override)]
+
     pin_memory = torch.cuda.is_available()
-
-    # all_runs:
-    # 모든 profile/seed/SNR 조합의 raw 평가 결과를 누적한다.
     all_runs = []
-
-    # latency_rows:
-    # 각 profile/seed 조합의 benchmark 결과를 누적한다.
     latency_rows = []
 
-    # receiver_profiles를 순회하면서 profile별 실행을 시작한다.
-    for receiver_profile in CFG["receiver_profiles"]:
-        # build_profile_runtime_configs:
-        # 이 profile에 정의된 override를 기본 설정 위에 덮어 실제 실행 설정을 만든다.
+    for receiver_profile in selected_receiver_profiles:
+        runtime_profile = copy.deepcopy(receiver_profile)
+
+        if seed_override is not None:
+            artifact_path = artifacts_by_profile.get(runtime_profile["name"], {}).get(int(seed_override))
+            if artifact_path:
+                runtime_profile["checkpoint_path"] = artifact_path
+                print(f"-> Saved artifact found for {runtime_profile['name']} / seed {seed_override}: {artifact_path}")
+            else:
+                runtime_profile.pop("checkpoint_path", None)
+                if selected_saved_seed:
+                    raise RuntimeError(
+                        f"Saved-seed mode was selected, but no artifact exists for "
+                        f"{runtime_profile['name']} / seed {seed_override}."
+                    )
+
         experiment_cfg, train_cfg, feature_cfg, model_cfg, benchmark_cfg = build_profile_runtime_configs(
-            receiver_profile,
+            runtime_profile,
             base_experiment_cfg,
             base_train_cfg,
             base_feature_cfg,
@@ -67,16 +298,13 @@ def main():
             base_benchmark_cfg,
         )
 
-        print(f"\n{'=' * 60}\n[PROFILE: {receiver_profile['name']}]\n{'=' * 60}")
+        print(f"\n{'=' * 60}\n[PROFILE: {runtime_profile['name']}]\n{'=' * 60}")
 
-        # 하나의 profile 안에서 여러 seed를 순회한다.
         for seed in experiment_cfg["seeds"]:
             print(f"\n{'-' * 60}\n[SEED: {seed}]\n{'-' * 60}")
 
-            # run_profile_seed:
-            # 학습 -> calibration -> seen/unseen 평가 -> benchmark까지 한 번에 수행한다.
             run_rows, latency_row = run_profile_seed(
-                receiver_profile,
+                runtime_profile,
                 seed,
                 artifact_cfg=artifact_cfg,
                 hybrid_cfg=hybrid_cfg,
@@ -89,30 +317,29 @@ def main():
                 pin_memory=pin_memory,
             )
 
-            # profile/seed 실행이 끝나면 raw 결과와 benchmark 결과를 누적한다.
             all_runs.extend(run_rows)
             latency_rows.append(latency_row)
 
-    # build_experiment_summary:
-    # raw 평가 결과를 평균/표준편차 요약표로 바꾼다.
     summary = build_experiment_summary(all_runs)
-
-    # build_latency_summary:
-    # benchmark raw 결과를 profile별 요약표로 바꾼다.
     latency_summary = build_latency_summary(latency_rows)
 
-    # 내부 DataFrame은 기존 짧은 컬럼명을 쓰지만,
-    # 저장용 CSV는 사람이 읽기 쉬운 컬럼명으로 바꿔 저장한다.
-    save_experiment_summary_csv(summary)
-    save_latency_summary_csv(latency_summary)
+    effective_shared_channel_state = base_experiment_cfg.get("shared_channel_state_across_snr", False)
+    timestamp, saved_dirs = _save_outputs_by_profile(
+        summary,
+        latency_summary,
+        selected_receiver_profiles,
+        effective_shared_channel_state,
+    )
 
-    # 마지막으로 summary / ablation 그래프를 생성한다.
-    plot_summary(summary)
-    plot_policy_ablation(summary)
-
-    print(f"Saved CSV files in ./{CSV_DIR} and plot PNG files in ./{GRAPH_DIR}.")
+    unique_dirs = list(dict.fromkeys(saved_dirs))
+    if unique_dirs:
+        print("Saved CSV and plot files to:")
+        for output_dir in unique_dirs:
+            print(f"  .\\{output_dir}")
+        print(f"Timestamp suffix: {timestamp}")
+    else:
+        print("No output files were saved because no summary rows were produced.")
 
 
 if __name__ == "__main__":
-    # 스크립트를 직접 실행했을 때만 main()을 호출한다.
-    main()
+    main(interactive=True)

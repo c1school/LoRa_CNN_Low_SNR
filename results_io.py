@@ -16,16 +16,12 @@ CSV_DIR = "csv"
 CSV_RENAME_MAP = {
     "ser_single_mean": "ser_default_lora_mean",
     "ser_single_std": "ser_default_lora_std",
-    "ser_mh_mean": "ser_enhanced_lora_mean",
-    "ser_mh_std": "ser_enhanced_lora_std",
     "ser_c_mean": "ser_full_cnn_mean",
     "ser_c_std": "ser_full_cnn_std",
     "ser_h_mean": "ser_hybrid_cnn_mean",
     "ser_h_std": "ser_hybrid_cnn_std",
     "per_single_mean": "per_default_lora_mean",
     "per_single_std": "per_default_lora_std",
-    "per_mh_mean": "per_enhanced_lora_mean",
-    "per_mh_std": "per_enhanced_lora_std",
     "per_c_mean": "per_full_cnn_mean",
     "per_c_std": "per_full_cnn_std",
     "per_h_mean": "per_hybrid_cnn_mean",
@@ -34,8 +30,6 @@ CSV_RENAME_MAP = {
     "util_std": "cnn_utilization_std",
     "single_ms_mean": "default_lora_ms_mean",
     "single_ms_std": "default_lora_ms_std",
-    "mh_ms_mean": "enhanced_lora_ms_mean",
-    "mh_ms_std": "enhanced_lora_ms_std",
     "cnn_ms_mean": "full_cnn_ms_mean",
     "cnn_ms_std": "full_cnn_ms_std",
     "hybrid_ms_mean": "hybrid_cnn_ms_mean",
@@ -46,11 +40,9 @@ CSV_RENAME_MAP = {
 # 실험 요약표에서 평균/표준편차를 낼 대상 metric 목록이다.
 RESULT_METRIC_COLS = [
     "ser_single",
-    "ser_mh",
     "ser_c",
     "ser_h",
     "per_single",
-    "per_mh",
     "per_c",
     "per_h",
     "util",
@@ -63,7 +55,6 @@ LATENCY_METRIC_COLS = [
     "num_hypotheses",
     "feature_elements",
     "single_ms",
-    "mh_ms",
     "cnn_ms",
     "hybrid_ms",
 ]
@@ -98,21 +89,21 @@ def build_latency_summary(latency_rows):
     return flatten_summary_columns(latency_summary)
 
 
-def save_experiment_summary_csv(summary, csv_dir: str = CSV_DIR):
+def save_experiment_summary_csv(summary, csv_dir: str = CSV_DIR, filename: str = "experiment_summary.csv"):
     """실험 요약표를 CSV로 저장한다."""
 
     os.makedirs(csv_dir, exist_ok=True)
     summary_csv = summary.rename(columns=CSV_RENAME_MAP)
-    output_path = os.path.join(csv_dir, "experiment_summary.csv")
+    output_path = os.path.join(csv_dir, filename)
     summary_csv.to_csv(output_path, index=False)
     return output_path
 
 
-def save_latency_summary_csv(latency_summary, csv_dir: str = CSV_DIR):
+def save_latency_summary_csv(latency_summary, csv_dir: str = CSV_DIR, filename: str = "latency_summary.csv"):
     """지연시간 요약표를 CSV로 저장한다."""
 
     os.makedirs(csv_dir, exist_ok=True)
     latency_summary_csv = latency_summary.rename(columns=CSV_RENAME_MAP)
-    output_path = os.path.join(csv_dir, "latency_summary.csv")
+    output_path = os.path.join(csv_dir, filename)
     latency_summary_csv.to_csv(output_path, index=False)
     return output_path

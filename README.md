@@ -38,16 +38,7 @@
 - FFT 수행
 - grouped-bin 에너지로 심볼 결정
 
-### 2.2 Enhanced LoRa
-
-기본 복조기를 강화한 기준선이다.
-
-- 여러 CFO 가설
-- 여러 timing offset 가설
-- 각 가설에서 dechirp + FFT 수행
-- 가장 유리한 에너지를 주는 결과를 선택
-
-### 2.3 Full CNN
+### 2.2 Full CNN
 
 모든 심볼에 대해 CNN을 적용하는 경로이다.
 
@@ -55,7 +46,7 @@
 - 생성된 2채널 특징(real / imag)을 2D CNN에 입력
 - CNN이 직접 심볼 클래스를 분류
 
-### 2.4 Hybrid CNN
+### 2.3 Hybrid CNN
 
 기본 복조기와 CNN을 함께 사용하는 경로이다.
 

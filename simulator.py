@@ -640,36 +640,3 @@ class GPUOnlineSimulator:
             return features, torch.cat(energy_chunks, dim=1)
         return features
 
-    def multi_hypothesis_grouped_bin(
-        self,
-        rx_signals: torch.Tensor,
-        cfo_grid: torch.Tensor = None,
-        to_grid: torch.Tensor = None,
-        window_size: int = None,
-        helper: Optional[Dict] = None,
-    ):
-        """다중 가설 classical baseline의 score를 계산한다.
-
-        이 경로에는 CNN이 없다.
-
-        아이디어는 단순하다.
-        - CFO/TO 가설을 여러 개 본다.
-        - 각 가설에서 심볼별 에너지를 계산한다.
-        - 가설 축에서 최댓값을 취해 "이 심볼은 어떤 가설에서는 잘 맞는다"를 score로 쓴다.
-
-        따라서 이 함수는
-        "동일한 hypothesis search를 neural 없이 돌리면 어디까지 가는가"
-        를 보는 비교 기준으로 쓰인다.
-        """
-
-        patch_size = 2 * window_size + 1 if window_size is not None else helper["patch_size"]
-        _, energy_bank = self.extract_multi_hypothesis_bank(
-            rx_signals,
-            cfo_grid,
-            to_grid,
-            patch_size=patch_size,
-            return_energy=True,
-            helper=helper,
-        )
-        collapsed_energy = torch.max(energy_bank, dim=1).values
-        return collapsed_energy, energy_bank

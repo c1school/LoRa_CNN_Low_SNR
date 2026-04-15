@@ -104,7 +104,7 @@ def _validate_record(record: Dict[str, torch.Tensor]) -> None:
     """레코드 안의 예측 길이가 모두 동일한지 검증한다."""
 
     base_length = record["labels"].numel()
-    for key in ("pred_single", "pred_mh", "pred_cnn", "confidence"):
+    for key in ("pred_single", "pred_cnn", "confidence"):
         if record[key].numel() != base_length:
             raise ValueError(f"`{key}` has {record[key].numel()} samples but expected {base_length}.")
 
@@ -124,7 +124,6 @@ def collect_receiver_outputs(
 
     - labels
     - Default LoRa 예측
-    - Enhanced LoRa 예측
     - Full CNN 예측
     - Default LoRa confidence
     """
@@ -160,7 +159,6 @@ def collect_receiver_outputs(
             rx_signals = rx_signals.to(simulator.device)
 
             pred_single = []
-            pred_mh = []
             pred_cnn = []
             confidence = []
 
@@ -177,21 +175,17 @@ def collect_receiver_outputs(
                 pred_single.append(torch.argmax(grouped_single, dim=1))
                 confidence.append(get_confidence(grouped_single, conf_type=conf_type))
 
-                # Enhanced LoRa와 Full CNN은 같은 hypothesis bank를 공유한다.
-                features, energy_bank = simulator.extract_multi_hypothesis_bank(
+                # Full CNN 입력용 hypothesis feature bank를 추출한다.
+                features = simulator.extract_multi_hypothesis_bank(
                     rx_batch,
                     helper=helper,
-                    return_energy=True,
                 )
-                mh_scores = torch.max(energy_bank, dim=1).values
-                pred_mh.append(torch.argmax(mh_scores, dim=1))
                 pred_cnn.append(torch.argmax(model(features), dim=1))
 
             # GPU 메모리 점유를 줄이기 위해 결과는 CPU로 내려 저장한다.
             record = {
                 "labels": labels.cpu(),
                 "pred_single": torch.cat(pred_single).cpu(),
-                "pred_mh": torch.cat(pred_mh).cpu(),
                 "pred_cnn": torch.cat(pred_cnn).cpu(),
                 "confidence": torch.cat(confidence).cpu(),
             }
@@ -365,7 +359,6 @@ def summarize_outputs(
         _validate_record(record)
         labels = record["labels"]
         pred_single = record["pred_single"]
-        pred_mh = record["pred_mh"]
         pred_cnn = record["pred_cnn"]
         confidence = record["confidence"]
 
@@ -378,11 +371,9 @@ def summarize_outputs(
 
         stats[snr] = {
             "ser_single": _compute_sample_error_rate(labels, pred_single),
-            "ser_mh": _compute_sample_error_rate(labels, pred_mh),
             "ser_c": _compute_sample_error_rate(labels, pred_cnn),
             "ser_h": _compute_sample_error_rate(labels, pred_hybrid),
             "per_single": _compute_packet_error_rate(labels, pred_single, payload_symbols),
-            "per_mh": _compute_packet_error_rate(labels, pred_mh, payload_symbols),
             "per_c": _compute_packet_error_rate(labels, pred_cnn, payload_symbols),
             "per_h": _compute_packet_error_rate(labels, pred_hybrid, payload_symbols),
             "util": use_cnn.float().mean().item() * 100.0,
@@ -523,16 +514,6 @@ def benchmark_receivers(
         with torch.inference_mode():
             simulator.baseline_grouped_bin(rx_batch, window_size=feature_cfg["baseline_window"])
 
-    def mh_path():
-        """Enhanced LoRa 경로만 실행한다."""
-
-        with torch.inference_mode():
-            simulator.multi_hypothesis_grouped_bin(
-                rx_batch,
-                helper=helper,
-                window_size=feature_cfg["baseline_window"],
-            )
-
     def cnn_path():
         """Full CNN 경로만 실행한다."""
 
@@ -563,12 +544,6 @@ def benchmark_receivers(
     return {
         "single_ms": benchmark_callable(
             single_path,
-            device=simulator.device,
-            warmup=benchmark_cfg["warmup"],
-            repeats=benchmark_cfg["repeats"],
-        ),
-        "mh_ms": benchmark_callable(
-            mh_path,
             device=simulator.device,
             warmup=benchmark_cfg["warmup"],
             repeats=benchmark_cfg["repeats"],

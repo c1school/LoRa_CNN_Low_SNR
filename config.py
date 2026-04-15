@@ -176,6 +176,7 @@ CFG = {
         # test_snrs:
         # calibration / seen / unseen 평가에 사용할 SNR 지점 목록이다.
         "test_snrs": list(range(-21, 1)),
+        "shared_channel_state_across_snr": False,
     },
 
     # hybrid:
