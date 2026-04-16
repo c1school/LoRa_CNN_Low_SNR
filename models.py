@@ -1,101 +1,105 @@
+"""LoRa hypothesis feature bank를 입력으로 받아 심볼 클래스를 분류하는 CNN 정의 파일이다."""
+
 import torch
 import torch.nn as nn
+
 from config import CFG
 
 
 class Hypothesis2DCNN(nn.Module):
-    """
-    다중 가설 2차원 특징맵을 입력으로 받아 LoRa 심볼을 분류하는 모델이다.
-
-    입력 텐서의 기본 형태는 다음과 같다.
-    [Batch, 2, Num_Hypotheses, Num_Bins]
-
-    각 차원의 의미는 다음과 같다.
-    - Batch          : 한 번에 처리하는 샘플 수이다.
-    - 2              : 실수부와 허수부 채널이다.
-    - Num_Hypotheses : CFO / Timing Offset 가설의 총개수이다.
-    - Num_Bins       : 심볼 중심 주변 patch까지 포함한 주파수 방향 길이이다.
-
-    이 모델은 2D CNN을 이용해
-    "가설 축 방향 패턴"과 "주파수 축 방향 패턴"을 동시에 읽도록 설계하였다.
-    """
+    """여러 CFO / timing hypothesis를 펼쳐 놓은 feature bank를 분류하는 CNN이다."""
 
     def __init__(
         self,
         num_classes: int,
-        num_hypotheses: int = CFG["cfo_steps"] * CFG["to_steps"],
-        num_bins: int = (2 ** CFG["sf"]) * CFG["patch_size"],
+        num_hypotheses: int = CFG["feature_bank"]["cfo_steps"] * CFG["feature_bank"]["to_steps"],
+        num_bins: int = None,
         in_channels: int = 2,
+        stage_channels=None,
+        classifier_hidden: int = None,
+        dropout: float = None,
+        width_scale: float = None,
     ):
-        super(Hypothesis2DCNN, self).__init__()
+        super().__init__()
 
-        # ------------------------------------------------------------
-        # 특징 추출부
-        # ------------------------------------------------------------
-        # Conv2d를 사용하여
-        # 1) 가설들 사이의 공간적 패턴
-        # 2) 주파수 주변 patch의 지역적 패턴
-        # 을 동시에 학습하도록 하였다.
+        # num_bins를 따로 주지 않으면
+        # 첫 번째 receiver_profile의 기본 SF와 patch_size를 이용해 기본값을 만든다.
+        if num_bins is None:
+            num_bins = (2 ** CFG["receiver_profiles"][0]["sf"]) * CFG["feature_bank"]["patch_size"]
+
+        # model_cfg:
+        # config.py에 들어 있는 CNN 기본 설정이다.
+        model_cfg = CFG.get("model", {})
+
+        # width_scale / classifier_hidden / dropout은 함수 인자로 덮어쓸 수 있다.
+        width_scale = model_cfg.get("width_scale", 1.0) if width_scale is None else width_scale
+        classifier_hidden = model_cfg.get("classifier_hidden", 256) if classifier_hidden is None else classifier_hidden
+        dropout = model_cfg.get("dropout", 0.3) if dropout is None else dropout
+
+        # stage_channels를 직접 주지 않으면 config 기본 stage를 가져온다.
+        if stage_channels is None:
+            base_channels = model_cfg.get("stage_channels", [32, 64, 96, 128])
+
+            # width_scale을 적용해 실제 합성곱 채널 수를 만든다.
+            # 8의 배수에 맞춰 반올림하는 이유는 메모리 정렬과 구현 편의를 위한 것이다.
+            stage_channels = [
+                max(8, int(round((channel * width_scale) / 8.0) * 8))
+                for channel in base_channels
+            ]
+
+        # 이 모델은 4개 stage를 전제로 설계했으므로 길이가 다르면 에러를 낸다.
+        if len(stage_channels) != 4:
+            raise ValueError("stage_channels must contain exactly four entries.")
+
+        # c1 ~ c4는 각 stage의 출력 채널 수다.
+        c1, c2, c3, c4 = stage_channels
+
+        # features:
+        # 입력 hypothesis bank에서 지역적인 패턴을 추출하는 feature extractor다.
         self.features = nn.Sequential(
-            # 첫 번째 블록이다.
-            # 가장 원시적인 지역 특징을 추출한다.
-            nn.Conv2d(in_channels, 32, kernel_size=5, padding=2),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(in_channels, c1, kernel_size=5, padding=2),
+            nn.BatchNorm2d(c1),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-
-            # 두 번째 블록이다.
-            # 더 넓은 범위의 상관관계를 학습한다.
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(c1, c2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(c2),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-
-            # 세 번째 블록이다.
-            # 보다 추상적인 패턴을 추출한다.
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(c2, c3, kernel_size=3, padding=1),
+            nn.BatchNorm2d(c3),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-
-            # 네 번째 블록이다.
-            # 마지막으로 특징을 압축하고 분류기 입력으로 넘긴다.
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(c3, c4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(c4),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
         )
 
-        # 합성곱 결과를 일렬로 펴기 위한 계층이다.
-        self.flatten = nn.Flatten()
+        # pool:
+        # hypothesis 수와 patch 길이가 profile마다 달라도
+        # classifier 입력 차원을 고정하기 위해 adaptive average pooling을 사용한다.
+        self.pool = nn.AdaptiveAvgPool2d((4, 16))
 
-        # ------------------------------------------------------------
-        # 출력 차원 자동 계산
-        # ------------------------------------------------------------
-        # 입력 크기가 설정값에 따라 달라질 수 있으므로,
-        # 더미 텐서를 한 번 통과시켜 flatten 차원을 자동 계산하였다.
+        # 더미 입력을 한 번 통과시켜 classifier 입력 차원을 계산한다.
         with torch.no_grad():
-            dummy_x = torch.zeros(1, in_channels, num_hypotheses, num_bins)
-            dummy_out = self.features(dummy_x)
-            flattened_size = dummy_out.view(1, -1).size(1)
+            dummy = torch.zeros(1, in_channels, num_hypotheses, num_bins)
+            flattened_size = self.pool(self.features(dummy)).view(1, -1).size(1)
 
-        # ------------------------------------------------------------
-        # 분류기
-        # ------------------------------------------------------------
+        # classifier:
+        # convolution feature를 flatten한 뒤 최종 심볼 클래스를 출력한다.
         self.classifier = nn.Sequential(
-            nn.Linear(flattened_size, 512),
+            nn.Flatten(),
+            nn.Linear(flattened_size, classifier_hidden),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(512, num_classes),
+            nn.Dropout(dropout),
+            nn.Linear(classifier_hidden, num_classes),
         )
 
     def forward(self, x):
-        # 1) 2D CNN으로 특징을 추출한다.
+        """입력 feature bank를 받아 클래스 logits를 반환한다."""
+
+        # 먼저 convolution feature extractor를 통과시킨다.
         x = self.features(x)
-
-        # 2) 선형 분류기로 넘기기 위해 펼친다.
-        x = self.flatten(x)
-
-        # 3) 최종 심볼 logits를 계산한다.
-        x = self.classifier(x)
-        return x
+        # 그 다음 adaptive pooling으로 크기를 고정한다.
+        x = self.pool(x)
+        # 마지막으로 classifier를 통과시켜 logits를 만든다.
+        return self.classifier(x)

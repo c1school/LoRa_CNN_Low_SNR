@@ -1,7 +1,4 @@
 *.png
-saved_models/
-*.pth
-*.pt
 __pycache__/
 *.py[cod]
 *$py.class
@@ -14,3 +11,5 @@ env/
 .DS_Store
 Thumbs.db
 *.csv
+colab_run.py
+plot_from_csv.py

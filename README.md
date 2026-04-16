@@ -1,362 +1,223 @@
-# LoRa Hybrid Receiver for Ultra-Low SNR
+# LoRa 페이로드 심볼 복조 실험 코드
 
-표준 LoRa `dechirp + FFT` 복조기의 **ultra-low SNR 취약 구간**을 신경망으로 보완하기 위한 연구용 코드이다.
+이 저장소는 **LoRa 수신 과정 전체를 구현한 코드가 아니라, coarse synchronization 이후의 payload symbol demodulation 구간**을 대상으로 한다.
 
-이 저장소는 다음 질문에 답하기 위해 설계되었다.
+즉, 이 코드는 다음과 같은 질문에 답하기 위해 작성되었다.
 
-- 기존 LoRa 복조기는 매우 낮은 SNR에서 어디서부터 흔들리는가
-- 그 취약 구간만 신경망으로 보완하면 성능을 높일 수 있는가
-- 항상 CNN을 쓰지 않고, **필요한 경우에만 선택적으로 호출**하면 계산량을 줄일 수 있는가
+- 매우 낮은 SNR 환경에서 기본적인 LoRa 복조기만 사용할 때 어떤 한계가 생기는가?
+- 기존 복조기를 완전히 버리지 않고, 신뢰도가 낮은 경우에만 CNN을 보조적으로 사용하면 성능을 개선할 수 있는가?
+- CNN을 모든 심볼에 항상 적용하지 않고도 의미 있는 성능 이득을 얻을 수 있는가?
 
-핵심 구조는 다음과 같다.
+## 1. 코드가 다루는 범위
 
-1. **Classical Receiver**
-   - `dechirp + FFT`
-   - grouped-bin 기반 점수 계산
-   - top1 / top2 기반 confidence 산출
+이 저장소가 직접 다루는 범위는 다음과 같다.
 
-2. **Neural Receiver**
-   - CFO / Timing Offset 다중 가설을 적용한 2차원 특징맵 생성
-   - local frequency patch를 포함한 2D CNN 분류
+- LoRa 심볼 생성
+- 잔여 CFO, timing offset, multipath, phase noise, tone interference, AWGN이 포함된 수신 신호 생성
+- 기본 복조기와 CNN 기반 복조기 비교
+- confidence 기반 하이브리드 선택 정책 보정
+- SER / PER / CNN 사용률 / 지연시간 측정
 
-3. **Hybrid Policy**
-   - classical confidence가 낮을 때만 CNN 결과를 사용
-   - 고정 threshold와 adaptive threshold를 모두 비교 평가
+이 저장소가 직접 다루지 않는 범위는 다음과 같다.
 
----
+- preamble detection
+- packet synchronization loop 전체
+- FEC / CRC / full frame decoding
+- 실제 SDR 장비 기반 실측 데이터 수집
+- 임베디드 배치나 하드웨어 가속기 수준의 최적화
 
-## 1. 프로젝트 개요
+## 2. 수신기 구성
 
-일반적인 LoRa 복조는 dechirp 후 FFT peak를 보는 방식으로 동작한다. 이 방법은 계산량이 작고 직관적이지만, SNR이 매우 낮고 CFO나 multipath가 존재하면 peak가 흐려져 오검출 가능성이 커진다.
+실험에서는 네 가지 수신 경로를 비교한다.
 
-이 프로젝트는 이 문제를 다음 방식으로 해결한다.
+### 2.1 Default LoRa
 
-- 기존 LoRa 복조기를 **버리지 않는다**
-- 먼저 classical receiver로 심볼을 추정한다
-- classical receiver의 confidence를 계산한다
-- confidence가 낮은 구간에서만 CNN을 호출한다
-- 결과적으로 **성능과 계산량 사이의 trade-off**를 분석한다
+가장 기본적인 복조 경로이다.
 
-즉, 이 코드는 end-to-end black box 수신기가 아니라, **기존 복조기를 유지한 채 취약 구간만 보조하는 hybrid receiver**를 구현한다.
+- 수신 신호에 downchirp를 곱해 dechirp 수행
+- FFT 수행
+- grouped-bin 에너지로 심볼 결정
 
----
+### 2.2 Full CNN
 
-## 2. 현재 코드의 핵심 아이디어
+모든 심볼에 대해 CNN을 적용하는 경로이다.
 
-### 2.1 Classical Baseline
-수신 신호에 downchirp를 곱해 dechirp를 수행한 뒤 FFT를 적용한다.  
-각 심볼 중심 bin 주변의 에너지를 합산하여 grouped-bin score를 계산하고, 가장 큰 score를 갖는 심볼을 baseline prediction으로 사용한다.
+- 다중 CFO / timing hypothesis feature bank 생성
+- 생성된 2채널 특징(real / imag)을 2D CNN에 입력
+- CNN이 직접 심볼 클래스를 분류
 
-### 2.2 Multi-Hypothesis 2D Feature Bank
-낮은 SNR 환경에서는 단일 dechirp + FFT 결과만으로는 peak 구조를 제대로 읽기 어렵다.  
-그래서 이 코드에서는 다음 가설을 동시에 고려한다.
+### 2.3 Hybrid CNN
 
-- CFO hypothesis 여러 개
-- Timing Offset hypothesis 여러 개
-- 각 심볼 중심 주변의 local frequency patch
+기본 복조기와 CNN을 함께 사용하는 경로이다.
 
-이렇게 만들어진 결과를 하나의 2차원 특징맵으로 쌓아 CNN 입력으로 사용한다.
+- 먼저 Default LoRa 결과와 confidence를 계산
+- confidence가 충분히 높으면 Default LoRa 결과 사용
+- confidence가 낮으면 CNN 결과 사용
 
-입력 텐서의 기본 형태는 다음과 같다.
+## 3. 채널 모델
 
-- `[Batch, 2, Num_Hypotheses, Num_Bins]`
+이 코드는 단순 AWGN만 넣는 환경이 아니라, 더 복잡한 impairment를 함께 포함한다.
 
-여기서
-- `2`는 실수부 / 허수부 채널
-- `Num_Hypotheses = cfo_steps * to_steps`
-- `Num_Bins = (2 ** sf) * patch_size`
+각 패킷은 payload 심볼 전체에 대해 하나의 공통 채널 상태를 유지하며, 다음 요소들이 포함될 수 있다.
 
-를 의미한다.
+- residual CFO
+- integer timing offset
+- fractional timing offset
+- multipath
+- carrier phase offset
+- phase noise
+- narrowband tone interference
+- AWGN
 
-### 2.3 Hybrid Decision
-classical grouped energy로부터 confidence를 계산한다.  
-현재 지원하는 confidence는 다음과 같다.
+평가용 채널은 두 가지 계열로 나뉜다.
 
-- `ratio`
-- `norm_margin`
-- `entropy`
+### 3.1 seen_eval
 
-기본값은 `ratio`이다.
+학습 때 사용한 분포와 유사한 채널이다.
 
-confidence가 충분히 높으면 classical 결과를 그대로 사용한다.  
-confidence가 낮으면 CNN 결과를 사용한다.
+### 3.2 unseen_eval
 
-즉 최종 결정은 다음 구조를 따른다.
+학습보다 더 가혹한 분포를 사용한다.
 
-- easy case → classical
-- hard case → CNN
+- 더 큰 CFO / timing spread
+- 더 많은 경로 수
+- 더 강한 multipath
+- 더 큰 phase noise
+- 더 높은 interference 확률
 
----
+## 4. 실험 프로파일
 
-## 3. 파일 구조
+기본 설정은 서로 다른 LoRa 동작점에 대해 별도의 모델을 학습한다.
 
-```text
-.
-├── config.py
-├── dataset.py
-├── evaluation.py
-├── main.py
-├── models.py
-├── simulator.py
-├── training.py
-├── utils.py
-└── README.md
-```
+- `sf7_bw125`
+- `sf8_bw125`
+- `sf9_bw250`
 
----
+각 프로파일은 다음 파라미터를 가진다.
 
-## 4. 파일별 설명
+- spreading factor
+- bandwidth
+- sampling rate
+- 필요하면 프로파일별 학습 설정 오버라이드
+- 필요하면 프로파일별 모델 크기 오버라이드
 
-### 4.1 `config.py`
-실험에 사용하는 주요 하이퍼파라미터를 중앙에서 관리한다.
+## 5. 측정 지표
 
-포함 내용:
-- 물리 계층 설정
-  - `sf`
-  - `bw`
-  - `fs`
-- 다중 가설 설정
-  - `max_cfo_bins`
-  - `patch_size`
-  - `cfo_steps`
-  - `to_steps`
-  - `max_to_samples`
+코드는 다음 지표를 저장한다.
+
+- `SER`: symbol error rate
+- `PER`: packet error rate
+- `CNN utilization`: 하이브리드 경로에서 CNN이 실제로 호출된 비율
+- `latency`: 각 수신기 경로의 상대적인 추론 시간
+- `parameter count`: CNN 학습 파라미터 수
+
+CSV 결과는 다음 위치에 저장된다.
+
+- `csv/experiment_summary.csv`
+- `csv/latency_summary.csv`
+
+그래프는 다음 위치에 저장된다.
+
+- `graph/`
+
+학습된 최적 모델은 다음 위치에 저장된다.
+
+- `artifacts/weights/`
+- `artifacts/checkpoints/`
+
+## 6. 파일별 설명
+
+### `config.py`
+
+전체 실험 설정을 모아 두는 파일이다.
+
+- 수신기 프로파일
+- feature bank 설정
 - 학습 설정
-  - `train_batch_size`
-  - `eval_batch_size`
-  - `num_epochs`
-  - `learning_rate`
-  - `packet_size`
 - 실험 설정
-  - `seeds`
-  - `test_snrs`
-  - `calib_samples`
-  - `test_samples`
-  - `train_samples`
+- 하이브리드 정책 설정
+- 벤치마크 설정
+- 채널 프로파일
 
-이 파일을 사용하면 여러 소스 파일에 흩어진 숫자를 한 곳에서 바꿀 수 있어 실험 관리가 쉬워진다.
+### `simulator.py`
 
-### 4.2 `dataset.py`
-학습용 파라미터 데이터셋과, 고정 validation/calibration/test 데이터셋을 생성한다.
+LoRa 심볼 생성과 채널 impairment 주입을 담당한다.
 
-#### `OnlineParametersDataset`
-실제 파형을 저장하지 않고, 샘플마다 `label`, `SNR`, `CFO`만 생성한다.  
-실제 수신 파형은 학습 루프에서 시뮬레이터가 온라인으로 생성한다.
+- upchirp / downchirp 생성
+- multipath 적용
+- timing shift 적용
+- CFO 적용
+- phase noise / interference 추가
+- AWGN 추가
+- 기본 복조기 연산
+- multi-hypothesis feature bank 추출
 
-#### `create_fixed_feature_dataset(...)`
-고정 validation dataset을 만든다.
+### `dataset.py`
 
-- label / SNR / CFO를 고정 생성한다
-- 실제 파형을 생성한다
-- 다중 가설 2D 특징맵으로 변환한다
-- `TensorDataset(labels, features)` 형태로 저장한다
+학습용 / 검증용 / 평가용 데이터셋을 만든다.
 
-#### `create_fixed_waveform_dataset(...)`
-calibration/test용 고정 dataset을 만든다.
+- 온라인 학습용 파라미터 샘플 dataset
+- 고정된 waveform validation dataset
+- SNR별 고정 waveform test dataset
+- recorded IQ `.npz` 로더
 
-- SNR별로 별도의 파형 세트를 생성한다
-- feature가 아니라 `rx_signals` 자체를 저장한다
+### `models.py`
 
-이유:
-- baseline grouped-bin 계산 필요
-- CNN feature bank 재생성 필요
-- hybrid policy 평가 필요
+2D CNN 기반 복조 모델을 정의한다.
 
-### 4.3 `simulator.py`
-프로젝트의 핵심 시뮬레이터이다.
+### `training.py`
 
-역할:
-1. 정답 심볼로부터 LoRa 송신 파형 생성
-2. multipath 적용
-3. CFO 적용
-4. AWGN 추가
-5. dechirp + FFT 특징 추출
-6. grouped-bin baseline 계산
-7. 다중 가설 2D feature bank 생성
+학습 루프를 담당한다.
 
-#### 주요 함수
+- 온라인 채널 샘플링
+- feature extraction
+- CNN 학습
+- validation loss 추적
+- best weights / checkpoint 저장
 
-##### `generate_batch(...)`
-입력:
-- `labels`
-- `snrs_db`
-- `cfos_hz`
+### `evaluation.py`
 
-출력:
-- multipath, CFO, noise가 적용된 복소 수신 파형
+평가와 정책 보정을 담당한다.
 
-##### `extract_features(...)`
-단일 가설 dechirp + FFT 특징을 만든다.  
-형태는 `[Batch, 2, N]`이다.
+- confidence 계산
+- global threshold policy 보정
+- confidence-bin policy 보정
+- SER / PER 계산
+- receiver latency 측정
 
-##### `baseline_grouped_bin(...)`
-classical grouped-bin baseline를 계산한다.  
-각 심볼 중심 주변 에너지를 합산하여 점수를 만든다.
+### `main.py`
 
-##### `generate_hypothesis_grid(...)`
-CFO / timing offset 가설 격자를 만든다.
+실험 전체를 orchestration하는 진입점이다.
 
-##### `extract_multi_hypothesis_bank(...)`
-이 프로젝트의 핵심 함수이다.
+- 프로파일별 설정 병합
+- 데이터셋 생성
+- 모델 학습
+- calibration
+- seen / unseen 평가
+- CSV 저장
+- 그래프 저장
 
-처리 흐름:
-1. timing offset 가설별 신호 시프트
-2. CFO 가설별 보정 적용
-3. dechirp 수행
-4. FFT 수행
-5. 각 심볼 중심 주변 patch 추출
-6. 모든 결과를 2차원 feature bank로 결합
+### `utils.py`
 
-### 4.4 `models.py`
-다중 가설 2차원 특징맵을 입력으로 받아 LoRa 심볼을 분류하는 2D CNN 모델을 정의한다.
+여러 파일에서 공통으로 쓰는 유틸리티 모음이다.
 
-#### `Hypothesis2DCNN`
-입력 형태:
-- `[Batch, 2, Num_Hypotheses, Num_Bins]`
+- seed 고정
+- CFO 범위 계산
+- 파라미터 수 계산
+- nested config 병합
+- benchmark용 타이머
 
-구성:
-- 2D convolution 블록 4개
-- BatchNorm
-- ReLU
-- MaxPool
-- Flatten
-- Fully Connected classifier
+### `colab_run.py`
 
-설계 의도:
-- 가설 축 방향 패턴을 본다
-- 주파수 축 patch 구조를 본다
-- 둘을 동시에 읽어 ultra-low SNR에서 더 robust한 심볼 분류를 수행한다
+Google Colab에서 메모리와 실행 시간을 고려해 실험을 돌릴 수 있도록 preset을 적용하는 실행 파일이다.
 
-### 4.5 `training.py`
-모델 학습을 담당한다.
+## 7. 실행 방법
 
-#### `train_online_model(...)`
-특징:
-- 학습용 파형을 미리 저장하지 않는다
-- 매 배치마다 simulator가 새로운 파형을 생성한다
-- 다중 가설 2D feature bank를 만들어 CNN에 넣는다
-- validation loss가 가장 낮은 시점의 모델을 최종 복원한다
+필수 패키지 설치:
 
-### 4.6 `evaluation.py`
-hybrid 정책 보정과 최종 평가를 담당한다.
-
-#### `get_confidence(...)`
-classical grouped energy로부터 confidence를 계산한다.
-
-#### `calibrate_adaptive_policy_joint(...)`
-SNR별 adaptive threshold를 calibration dataset으로 자동 탐색한다.
-
-목표:
-- SER / PER이 너무 나빠지지 않도록 제한한다
-- 그 조건 안에서 CNN utilization이 가장 낮은 threshold를 선택한다
-
-#### `run_evaluation(...)`
-fixed 또는 adaptive policy로 최종 성능을 평가한다.
-
-반환 정보:
-- `ser_g` : classical baseline SER
-- `ser_c` : full CNN SER
-- `ser_h` : hybrid SER
-- `per_g` : classical baseline PER
-- `per_c` : full CNN PER
-- `per_h` : hybrid PER
-- `util`  : CNN utilization
-- `th`    : 사용된 threshold
-
-### 4.7 `main.py`
-전체 파이프라인을 실행하는 메인 스크립트이다.
-
-실행 흐름:
-1. seed별 반복 실험
-2. simulator / model 생성
-3. validation / calibration / seen / unseen dataset 생성
-4. 온라인 학습
-5. adaptive policy 보정
-6. fixed / adaptive, seen / unseen 평가
-7. CSV 저장
-8. 그래프 생성
-
-또한 다음 두 종류의 시각화를 생성한다.
-
-#### `plot_summary(...)`
-- conventional LoRa
-- full CNN
-- hybrid
-- utilization
-
-을 한 그래프에 보여준다.
-
-#### `plot_ablation(...)`
-- fixed hybrid
-- adaptive hybrid
-
-를 직접 비교한다.
-
-### 4.8 `utils.py`
-재현성을 위한 seed 고정 함수가 들어 있다.
-
-#### `set_seed(...)`
-다음 난수 흐름을 고정한다.
-- NumPy
-- PyTorch
-- CUDA
-- Python hash seed
-- cuDNN deterministic 옵션
-
----
-
-## 5. 전체 파이프라인 요약
-
-이 프로젝트의 전체 흐름은 아래와 같다.
-
-### 단계 1. 파라미터 생성
-학습용 데이터셋은 label / SNR / CFO만 제공한다.
-
-### 단계 2. 온라인 파형 생성
-시뮬레이터가 GPU에서 즉석으로 LoRa 파형을 만든다.
-
-### 단계 3. Classical Receiver 계산
-dechirp + FFT + grouped-bin score를 계산한다.
-
-### 단계 4. Multi-Hypothesis Feature Bank 생성
-CFO / timing offset 가설과 local patch를 사용해 2D 입력을 만든다.
-
-### 단계 5. CNN 분류
-2D CNN이 심볼을 분류한다.
-
-### 단계 6. Confidence 기반 Hybrid 선택
-classical confidence가 높으면 baseline을 사용한다.  
-낮으면 CNN 결과를 사용한다.
-
-### 단계 7. SER / PER / Utilization 분석
-- baseline
-- full CNN
-- hybrid
-- fixed vs adaptive
-
-를 비교한다.
-
----
-
-## 6. 설치 방법
-
-### 권장 환경
-- Python 3.10+
-- PyTorch
-- NumPy
-- pandas
-- matplotlib
-
-### 예시 설치
 ```bash
 pip install torch numpy pandas matplotlib
 ```
-
-CUDA 사용 환경이면 GPU 버전에 맞는 PyTorch 설치가 필요하다.
-
----
-
-## 7. 실행 방법
 
 기본 실행:
 
@@ -364,169 +225,67 @@ CUDA 사용 환경이면 GPU 버전에 맞는 PyTorch 설치가 필요하다.
 python main.py
 ```
 
-실행 시 다음 작업이 순서대로 수행된다.
+Colab용 preset 실행:
 
-- seed 반복
-- 모델 학습
-- adaptive policy calibration
-- seen / unseen evaluation
-- 결과 CSV 저장
-- summary plot 저장
-- ablation plot 저장
+```bash
+python colab_run.py --mode sf7
+python colab_run.py --mode sf8
+python colab_run.py --mode sf9
+```
 
----
+추가 override 예시:
 
-## 8. 출력 파일
+```bash
+python colab_run.py --mode sf7 --epochs 10 --train-samples 20000
+```
 
-실행이 끝나면 보통 다음 파일들이 생성된다.
+## 8. 결과 해석 시 주의할 점
 
-- `experiment_summary.csv`
-- `experiment_main_seen.png`
-- `experiment_main_unseen.png`
-- `experiment_ablation_seen.png`
-- `experiment_ablation_unseen.png`
+### 8.1 `0 dB`가 무조건 `SER = 0`을 의미하지는 않는다
 
-### CSV 주요 컬럼
-- `type`
-  - `fixed_seen`
-  - `adapt_seen`
-  - `fixed_unseen`
-  - `adapt_unseen`
-- `snr`
-- `ser_g_mean`, `ser_c_mean`, `ser_h_mean`
-- `per_g_mean`, `per_c_mean`, `per_h_mean`
-- `util_mean`
-- `th_mean`
-- `*_std`
-- `n_runs`
+이 코드의 SNR은 AWGN만 따지는 값이지만, 채널에는 그 외 impairment가 함께 포함될 수 있다.
 
----
+즉 `0 dB`라고 해도
 
-## 9. 주요 설정값 설명
+- timing mismatch
+- multipath
+- phase noise
+- interference
 
-### `sf`
-Spreading Factor이다.  
-심볼 개수는 `2 ** sf`로 결정된다.
+때문에 오류가 남을 수 있다.
 
-### `max_cfo_bins`
-허용할 CFO 범위를 bin 단위로 지정한다.
+### 8.2 unseen 채널은 단조 감소하지 않을 수 있다
 
-### `patch_size`
-각 심볼 중심 주변 몇 개 bin을 함께 볼지 결정한다.
+SNR이 증가해도 unseen 채널에서 SER가 완전히 단조롭게 내려가지 않을 수 있다.
 
-### `cfo_steps`, `to_steps`
-CFO / Timing Offset 가설 개수이다.  
-이 값이 커질수록 특징맵이 커지고 계산량도 증가한다.
+이유는 다음과 같다.
 
-### `packet_size`
-PER 계산을 위해 몇 개 심볼을 한 패킷으로 묶을지 정한다.
+- impairment-limited 환경일 수 있음
+- SNR별 평가셋이 독립적으로 생성됨
+- seed 수가 적으면 곡선이 더 흔들릴 수 있음
 
-### `seeds`
-반복 실험 개수이다.  
-평균과 표준편차 계산에 사용된다.
+### 8.3 high-SNR 구간의 작은 스파이크는 표본 수 영향일 수 있다
 
----
+특히 Colab처럼 평가셋을 줄인 설정에서는 SNR별 샘플 수가 적어서 작은 오차 하나가 SER 곡선에 눈에 띄게 반영될 수 있다.
 
-## 10. 결과 해석 방법
+## 9. recorded IQ 데이터 사용
 
-### `ser_g`
-classical grouped-bin baseline의 SER이다.
+외부 측정 데이터를 사용하려면 `.npz` 파일에 다음 항목이 들어 있어야 한다.
 
-### `ser_c`
-full CNN을 항상 사용했을 때의 SER이다.
+- `labels`
+- `rx`
+  또는
+- `rx_real`, `rx_imag`
 
-### `ser_h`
-hybrid policy를 사용했을 때의 SER이다.
+이 로더는 `dataset.py`의 `load_recorded_waveform_dataset(...)`에 구현되어 있다.
 
-### `util`
-전체 샘플 중 실제로 CNN이 호출된 비율이다.
+## 10. 추가 확장 방향
 
-### 좋은 결과의 의미
-보통 아래 형태가 이상적이다.
+이 코드를 더 확장하려면 보통 다음 순서로 진행하면 된다.
 
-- `ser_c < ser_g`
-- `ser_h`가 `ser_c`에 가깝다
-- `util`은 full CNN 대비 낮다
-
-즉 CNN을 항상 쓰지 않아도, 어려운 구간만 선택적으로 보완하여 성능을 유지한다는 뜻이다.
-
----
-
-## 11. 이 프로젝트의 강점
-
-- 기존 LoRa 수신기를 버리지 않는다
-- classical receiver와 neural receiver를 함께 사용한다
-- ultra-low SNR 취약 구간만 집중적으로 보완한다
-- 성능뿐 아니라 CNN 호출률까지 함께 평가한다
-- fixed policy와 adaptive policy를 모두 비교한다
-- seen / unseen harsher channel을 분리 평가한다
-
----
-
-## 12. 한계와 주의점
-
-이 프로젝트는 연구용 시뮬레이션 코드이다.  
-따라서 다음 한계가 있다.
-
-- 실제 SDR 하드웨어 입력을 직접 처리하지 않는다
-- 완전한 LoRa PHY/MAC 스택 전체를 구현한 것은 아니다
-- packet_size 기반 PER은 연구용 surrogate metric이다
-- Python / PyTorch 기반이라 임베디드 배치용 코드는 아니다
-
-즉, 이 저장소는 **실제 수신기 아이디어를 검증하는 연구용 프로토타입**에 가깝다.
-
----
-
-## 13. 실용적 의미
-
-이 연구는 기존 LoRa 복조기를 완전히 대체하려는 것이 아니다.  
-대신 다음 상황을 겨냥한다.
-
-- ultra-low SNR에서 classical receiver가 애매해지는 구간
-- 게이트웨이 또는 연산 여유가 있는 수신기
-- 선택적으로 neural refinement를 붙이고 싶은 경우
-
-따라서 가장 자연스러운 적용 대상은 다음과 같다.
-
-- LoRa gateway
-- SDR 기반 수신기
-- PC / GPU 기반 실험 수신기
-- 고신뢰 복조가 필요한 서버 측 receiver
-
----
-
-## 14. 향후 확장 아이디어
-
-- 실제 SDR capture 데이터 평가
-- 더 작은 모델 경량화
-- learned gate 도입
-- multi-SF / multi-BW 확장
-- real-time inference profiling
-- ONNX / TensorRT 배포 최적화
-
----
-
-## 15. 저장소 사용 목적
-
-이 저장소는 다음 목적에 적합하다.
-
-- LoRa hybrid receiver 구조 학습
-- ultra-low SNR 보조 복조 연구
-
----
-
-## 16. 실행 전 체크리스트
-
-실행 전 아래를 확인하면 좋다.
-
-- CUDA가 정상 인식되는가
-- `config.py` 값이 현재 실험 목적과 맞는가
-- validation / calibration / test 샘플 수가 너무 크지 않은가
-- GPU 메모리와 시스템 RAM이 충분한가
-- 출력 CSV / 그래프 파일명이 기존 결과를 덮어쓰지 않는가
-
----
-
-## 17. 한 줄 요약
-
-이 프로젝트는 **표준 LoRa dechirp + FFT 복조기의 ultra-low SNR 취약 구간을, 다중 가설 2D CNN과 adaptive hybrid policy로 선택적으로 보완하는 연구용 receiver framework**이다.
+1. 실측 IQ 데이터 연결
+2. 더 정교한 synchronization 전처리 추가
+3. concurrent LoRa interference 모델 추가
+4. 프로파일별 학습 및 평가 반복
+5. seed 반복을 통한 평균 / 표준편차 정리
+6. 필요하면 full frame decoding 방향으로 확장
