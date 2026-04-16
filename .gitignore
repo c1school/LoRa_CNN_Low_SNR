@@ -1,7 +1,4 @@
 *.png
-saved_models/
-*.pth
-*.pt
 __pycache__/
 *.py[cod]
 *$py.class

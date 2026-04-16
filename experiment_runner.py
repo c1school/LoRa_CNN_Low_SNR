@@ -217,18 +217,6 @@ def run_profile_seed(
     # profile 설정에 맞는 CNN 모델을 만든다.
     model = _build_model(simulator, feature_cfg, model_cfg)
 
-    # validation / calibration / test용 고정 데이터셋을 만든다.
-    ds_val, ds_calib, ds_test_seen, ds_test_unseen = _build_datasets(
-        simulator,
-        experiment_cfg,
-        channel_profiles,
-        seed,
-    )
-
-    # train은 online parameter dataset, val은 fixed waveform dataset을 사용한다.
-    dl_train = _build_train_loader(simulator, experiment_cfg, train_cfg, channel_profiles, pin_memory)
-    dl_val = _build_val_loader(ds_val, train_cfg, pin_memory)
-
     checkpoint_path = receiver_profile.get("checkpoint_path")
 
     if checkpoint_path:
@@ -237,6 +225,17 @@ def run_profile_seed(
         _load_model_from_checkpoint(model, checkpoint_path, simulator.device)
         print(f"-> Loaded checkpoint for evaluation only: {checkpoint_path}")
     else:
+        # 학습이 필요한 경우에만 validation / calibration / test용 고정 데이터셋을 만들고,
+        # train/val DataLoader까지 구성한다.
+        ds_val, ds_calib, ds_test_seen, ds_test_unseen = _build_datasets(
+            simulator,
+            experiment_cfg,
+            channel_profiles,
+            seed,
+        )
+        dl_train = _build_train_loader(simulator, experiment_cfg, train_cfg, channel_profiles, pin_memory)
+        dl_val = _build_val_loader(ds_val, train_cfg, pin_memory)
+
         # train_online_model:
         # 학습을 수행하고 best validation checkpoint를 복원한 모델을 반환한다.
         model = train_online_model(
@@ -262,6 +261,16 @@ def run_profile_seed(
                 "hybrid_cfg": hybrid_cfg,
                 "train_channel_profile": simulator.resolve_channel_profile(channel_profiles["train"]),
             },
+        )
+
+    # evaluation-only 경로에서도 calibration / seen / unseen 평가용 고정 데이터셋은 필요하다.
+    # 학습 경로에서는 위에서 이미 만들었으므로 다시 만들지 않는다.
+    if checkpoint_path:
+        _, ds_calib, ds_test_seen, ds_test_unseen = _build_datasets(
+            simulator,
+            experiment_cfg,
+            channel_profiles,
+            seed,
         )
 
     # collect_receiver_outputs:
